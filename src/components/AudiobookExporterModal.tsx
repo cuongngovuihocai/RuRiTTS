@@ -27,6 +27,7 @@ import {
 import {
   generateEdgeSpeech,
   generateGoogleTranslateSpeech,
+  isStaticHosting,
 } from '../services/geminiService';
 import { ThemeMode } from '../types';
 import { getThemeConfig } from '../utils/themeStyles';
@@ -78,7 +79,7 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
     const effectivePitch = Math.max(0.5, Math.min(1.5, voiceSettings.pitch * emotionAcoustics.pitchMultiplier));
     const effectiveVolume = Math.max(0, Math.min(1.0, voiceSettings.volume * emotionAcoustics.volumeMultiplier));
 
-    if (voiceSettings.engine === 'edge' && !isOffline) {
+    if (!isStaticHosting() && voiceSettings.engine === 'edge' && !isOffline) {
       try {
         const res = await generateEdgeSpeech(
           text,
@@ -95,6 +96,20 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
         }
       } catch (err) {
         console.warn('Edge TTS export failed, falling back to Google Translate TTS:', err);
+        try {
+          const res = await generateGoogleTranslateSpeech(text);
+          if (format === 'mp3') {
+            return base64ToBlob(res.audioBase64, 'audio/mp3');
+          } else {
+            const buffer = await decodeAudioBase64(res.audioBase64);
+            return audioBufferToWavBlob(buffer);
+          }
+        } catch {}
+      }
+    }
+
+    if (!isStaticHosting() && voiceSettings.engine === 'google-translate' && !isOffline) {
+      try {
         const res = await generateGoogleTranslateSpeech(text);
         if (format === 'mp3') {
           return base64ToBlob(res.audioBase64, 'audio/mp3');
@@ -102,17 +117,7 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
           const buffer = await decodeAudioBase64(res.audioBase64);
           return audioBufferToWavBlob(buffer);
         }
-      }
-    }
-
-    if (voiceSettings.engine === 'google-translate' && !isOffline) {
-      const res = await generateGoogleTranslateSpeech(text);
-      if (format === 'mp3') {
-        return base64ToBlob(res.audioBase64, 'audio/mp3');
-      } else {
-        const buffer = await decodeAudioBase64(res.audioBase64);
-        return audioBufferToWavBlob(buffer);
-      }
+      } catch {}
     }
 
     // Offline / Native Synthesizer fallback

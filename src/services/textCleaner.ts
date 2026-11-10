@@ -8,7 +8,8 @@ import { Chapter, CustomDictionaryEntry, SentenceItem } from '../types';
 export function createUnicodeWordRegex(word: string, caseSensitive: boolean = false): RegExp {
   const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const flags = caseSensitive ? 'gu' : 'giu';
-  return new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, flags);
+  // Use prefix capture group instead of lookbehind for universal iOS Safari compatibility
+  return new RegExp(`(^|[^\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, flags);
 }
 
 /**
@@ -100,40 +101,40 @@ export function cleanVietnameseTextOffline(
 
   // 5. Expand Dates (e.g., 02/09/1945 -> ngày 2 tháng 9 năm 1945)
   cleaned = cleaned.replace(
-    /(?<![\p{L}\p{N}])(\d{1,2})[/-](\d{1,2})[/-](\d{4})(?![\p{L}\p{N}])/gu,
-    (_, day, month, year) => `ngày ${parseInt(day, 10)} tháng ${parseInt(month, 10)} năm ${year}`
+    /(^|[^\p{L}\p{N}])(\d{1,2})[/-](\d{1,2})[/-](\d{4})(?![\p{L}\p{N}])/gu,
+    (_, prefix, day, month, year) => `${prefix}ngày ${parseInt(day, 10)} tháng ${parseInt(month, 10)} năm ${year}`
   );
 
   // 6. Expand Times (e.g., 14:30 -> 14 giờ 30 phút, 8h30 -> 8 giờ 30)
   cleaned = cleaned.replace(
-    /(?<![\p{L}\p{N}])(\d{1,2}):(\d{2})(?![\p{L}\p{N}])/gu,
-    (_, h, m) => `${parseInt(h, 10)} giờ ${m} phút`
+    /(^|[^\p{L}\p{N}])(\d{1,2}):(\d{2})(?![\p{L}\p{N}])/gu,
+    (_, prefix, h, m) => `${prefix}${parseInt(h, 10)} giờ ${m} phút`
   );
   cleaned = cleaned.replace(
-    /(?<![\p{L}\p{N}])(\d{1,2})h(\d{1,2})(?![\p{L}\p{N}])/giu,
-    (_, h, m) => `${parseInt(h, 10)} giờ ${m} phút`
+    /(^|[^\p{L}\p{N}])(\d{1,2})h(\d{1,2})(?![\p{L}\p{N}])/giu,
+    (_, prefix, h, m) => `${prefix}${parseInt(h, 10)} giờ ${m} phút`
   );
   cleaned = cleaned.replace(
-    /(?<![\p{L}\p{N}])(\d{1,2})h(?![\p{L}\p{N}])/giu,
-    (_, h) => `${parseInt(h, 10)} giờ`
+    /(^|[^\p{L}\p{N}])(\d{1,2})h(?![\p{L}\p{N}])/giu,
+    (_, prefix, h) => `${prefix}${parseInt(h, 10)} giờ`
   );
 
   // 7. Common Vietnamese measurement units & titles (Longest first, Unicode word boundary)
   cleaned = cleaned
-    .replace(/(?<![\p{L}\p{N}])(\d+)\s*km\/h(?![\p{L}\p{N}])/giu, '$1 ki-lô-mét một giờ')
-    .replace(/(?<![\p{L}\p{N}])(\d+)\s*km(?![\p{L}\p{N}])/giu, '$1 ki-lô-mét')
-    .replace(/(?<![\p{L}\p{N}])(\d+)\s*cm(?![\p{L}\p{N}])/giu, '$1 xăng-ti-mét')
-    .replace(/(?<![\p{L}\p{N}])(\d+)\s*kg(?![\p{L}\p{N}])/giu, '$1 ki-lô-gam')
-    .replace(/(?<![\p{L}\p{N}])(\d+)\s*m\b(?![\p{L}\p{N}])/giu, '$1 mét')
-    .replace(/(?<![\p{L}\p{N}])(\d+)\s*g\b(?![\p{L}\p{N}])/giu, '$1 gam')
-    .replace(/(?<![\p{L}\p{N}])(\d+)\s*°C(?![\p{L}\p{N}])/giu, '$1 độ C')
-    .replace(/(?<![\p{L}\p{N}])(\d+)\s*%(?![\p{L}\p{N}])/giu, '$1 phần trăm')
-    .replace(/(?<![\p{L}\p{N}])(\d+)\s*k(?![\p{L}\p{N}])/giu, '$1 nghìn')
-    .replace(/(?<![\p{L}\p{N}])(\d+)\s*tr(?![\p{L}\p{N}])/giu, '$1 triệu')
-    .replace(/(?<![\p{L}\p{N}])(\d+)\s*tỷ(?![\p{L}\p{N}])/giu, '$1 tỷ')
-    .replace(/(?<![\p{L}\p{N}])(\d+)\s*đ(?![\p{L}\p{N}])/giu, '$1 đồng')
-    .replace(/(?<![\p{L}\p{N}])(\d+)\s*VND(?![\p{L}\p{N}])/giu, '$1 Việt Nam đồng')
-    .replace(/(?<![\p{L}\p{N}])(\d+)\s*\$(?![\p{L}\p{N}])/giu, '$1 đô la');
+    .replace(/(^|[^\p{L}\p{N}])(\d+)\s*km\/h(?![\p{L}\p{N}])/giu, '$1$2 ki-lô-mét một giờ')
+    .replace(/(^|[^\p{L}\p{N}])(\d+)\s*km(?![\p{L}\p{N}])/giu, '$1$2 ki-lô-mét')
+    .replace(/(^|[^\p{L}\p{N}])(\d+)\s*cm(?![\p{L}\p{N}])/giu, '$1$2 xăng-ti-mét')
+    .replace(/(^|[^\p{L}\p{N}])(\d+)\s*kg(?![\p{L}\p{N}])/giu, '$1$2 ki-lô-gam')
+    .replace(/(^|[^\p{L}\p{N}])(\d+)\s*m\b(?![\p{L}\p{N}])/giu, '$1$2 mét')
+    .replace(/(^|[^\p{L}\p{N}])(\d+)\s*g\b(?![\p{L}\p{N}])/giu, '$1$2 gam')
+    .replace(/(^|[^\p{L}\p{N}])(\d+)\s*°C(?![\p{L}\p{N}])/giu, '$1$2 độ C')
+    .replace(/(^|[^\p{L}\p{N}])(\d+)\s*%(?![\p{L}\p{N}])/giu, '$1$2 phần trăm')
+    .replace(/(^|[^\p{L}\p{N}])(\d+)\s*k(?![\p{L}\p{N}])/giu, '$1$2 nghìn')
+    .replace(/(^|[^\p{L}\p{N}])(\d+)\s*tr(?![\p{L}\p{N}])/giu, '$1$2 triệu')
+    .replace(/(^|[^\p{L}\p{N}])(\d+)\s*tỷ(?![\p{L}\p{N}])/giu, '$1$2 tỷ')
+    .replace(/(^|[^\p{L}\p{N}])(\d+)\s*đ(?![\p{L}\p{N}])/giu, '$1$2 đồng')
+    .replace(/(^|[^\p{L}\p{N}])(\d+)\s*VND(?![\p{L}\p{N}])/giu, '$1$2 Việt Nam đồng')
+    .replace(/(^|[^\p{L}\p{N}])(\d+)\s*\$(?![\p{L}\p{N}])/giu, '$1$2 đô la');
 
   // 8. Custom dictionary and teencode expansion
   // Sort longest words first so that "PGS.TS" or "ngta" gets replaced before "TS" or "ng"
@@ -144,7 +145,7 @@ export function cleanVietnameseTextOffline(
   for (const entry of sortedDict) {
     if (!entry.word || !entry.replaceWith) continue;
     const regex = createUnicodeWordRegex(entry.word, !!entry.caseSensitive);
-    cleaned = cleaned.replace(regex, entry.replaceWith);
+    cleaned = cleaned.replace(regex, (_, prefix) => `${prefix}${entry.replaceWith}`);
   }
 
   // 9. Normalize whitespace and paragraph breaks
@@ -161,6 +162,7 @@ export function cleanVietnameseTextOffline(
 
 /**
  * Splits text into individual natural sentences for synchronized speech highlighting and TTS playback.
+ * 100% compliant with older iOS Safari browsers (no regex lookbehinds).
  */
 export function splitIntoSentences(text: string): SentenceItem[] {
   if (!text || !text.trim()) return [];
@@ -175,11 +177,19 @@ export function splitIntoSentences(text: string): SentenceItem[] {
   let index = 0;
 
   for (const para of paragraphs) {
-    // Within each paragraph, split by sentence punctuation
-    const rawSentences = para
-      .split(/(?<=[.!?…]["']?)(?:\s*\n+\s*|\s+(?=[A-ZÀÁẢÃẠĂẮẰẲẴẶÂẤẦẨẪẬÈÉẺẼẸÊẾỀỂỄỆÌÍỈĨỊÒÓỎÕỌÔỐỒỔỖỘƠỚỜỞỠỢÙÚỦŨỤƯỨỪỬỮỰỲÝỶỸỴĐ0-9"“]))/u)
-      .map((s) => s.trim())
-      .filter((s) => s.length > 0);
+    // Within each paragraph, split by sentence punctuation without lookbehind
+    const rawSentences: string[] = [];
+    const sentenceRegex = /[^.!?…\n]+(?:[.!?…]+["'”»)]*)?/gu;
+    let match: RegExpExecArray | null;
+    while ((match = sentenceRegex.exec(para)) !== null) {
+      const s = match[0].trim();
+      if (s.length > 0) {
+        rawSentences.push(s);
+      }
+    }
+    if (rawSentences.length === 0) {
+      rawSentences.push(para);
+    }
 
     // Group short adjacent sentences WITHIN the same paragraph (~180 chars max)
     const groupedInPara: string[] = [];
@@ -202,7 +212,7 @@ export function splitIntoSentences(text: string): SentenceItem[] {
     for (const itemText of groupedInPara) {
       // Only sub-split if an unbroken sentence is abnormally long (> 650 chars) without any punctuation
       if (itemText.length > 650) {
-        const clauses = itemText.split(/(?<=[;:\n])\s+/).filter((c) => c.trim().length > 0);
+        const clauses = itemText.split(/[;:\n]\s+/).filter((c) => c.trim().length > 0);
         for (const c of clauses) {
           result.push({
             id: `sent_${index}`,

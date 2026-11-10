@@ -5,6 +5,29 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <script>
       (function() {
+        // Polyfill Promise.withResolvers for Safari iOS < 17.4
+        if (typeof Promise.withResolvers === 'undefined') {
+          Promise.withResolvers = function() {
+            var resolve, reject;
+            var promise = new Promise(function(res, rej) {
+              resolve = res;
+              reject = rej;
+            });
+            return { promise: promise, resolve: resolve, reject: reject };
+          };
+        }
+
+        // Polyfill URL.canParse for older Safari iOS
+        if (typeof URL.canParse === 'undefined') {
+          URL.canParse = function(url, base) {
+            try {
+              return !!new URL(url, base);
+            } catch (e) {
+              return false;
+            }
+          };
+        }
+
         var suppress = function(e) {
           var msg = (e && (e.message || (e.reason && e.reason.message))) || '';
           var file = (e && e.filename) || '';

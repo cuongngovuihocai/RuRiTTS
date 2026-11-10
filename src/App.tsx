@@ -41,6 +41,7 @@ import {
 import {
   generateEdgeSpeech,
   generateGoogleTranslateSpeech,
+  isStaticHosting,
 } from './services/geminiService';
 
 import { Header } from './components/Header';
@@ -155,6 +156,12 @@ export default function App() {
           clearTimeout(timer);
           return null;
         }
+      }
+
+      // On static hosting (GitHub Pages), backend TTS endpoints return 405.
+      // Return null immediately so App.tsx plays using native browser SpeechSynthesis instantly with zero delay!
+      if (isStaticHosting()) {
+        return null;
       }
 
       if (vSettings.engine === 'edge' && !isOffline) {
@@ -339,9 +346,18 @@ export default function App() {
       const detectedVoices = await getAvailableVietnameseVoices();
       setVoices(detectedVoices);
 
-      // Pick default voice if not set or invalid
-      if (!savedVoiceSettings.voiceId || savedVoiceSettings.voiceId === 'native_default_vi' || isDeprecatedId) {
-        const defaultVoice = detectedVoices.find((v) => v.id === DEFAULT_SETTINGS.voiceId) || detectedVoices[0];
+      // Pick default voice if not set or invalid, or on static hosting without server
+      const shouldPickDefault =
+        !savedVoiceSettings.voiceId ||
+        savedVoiceSettings.voiceId === 'native_default_vi' ||
+        isDeprecatedId ||
+        (isStaticHosting() && savedVoiceSettings.engine !== 'native');
+
+      if (shouldPickDefault) {
+        const defaultVoice = isStaticHosting()
+          ? detectedVoices.find((v) => v.engine === 'native') || detectedVoices[0]
+          : detectedVoices.find((v) => v.id === DEFAULT_SETTINGS.voiceId) || detectedVoices[0];
+
         if (defaultVoice) {
           setVoiceSettings((prev) => ({
             ...prev,

@@ -33,6 +33,7 @@ import {
 import {
   generateEdgeSpeech,
   generateGoogleTranslateSpeech,
+  isStaticHosting,
 } from '../services/geminiService';
 import { getThemeConfig, HIGHLIGHT_PRESETS, THEME_CONFIGS } from '../utils/themeStyles';
 
@@ -180,96 +181,115 @@ export const VoiceSettingsModal: React.FC<VoiceSettingsModalProps> = ({
     const effectivePitch = Math.max(0.5, Math.min(1.5, voiceSettings.pitch * emotionAcoustics.pitchMultiplier));
     const effectiveVolume = Math.max(0, Math.min(1.0, voiceSettings.volume * emotionAcoustics.volumeMultiplier));
 
-    try {
-      if (targetVoice.engine === 'edge' && !isOffline) {
-        const res = await generateEdgeSpeech(
-          sampleText,
-          targetVoice.id,
-          effectiveRate,
-          effectivePitch,
-          effectiveVolume
-        );
-        let buffer = await decodeAudioBase64(res.audioBase64);
+    const playWithNative = () => {
+      if ('speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+        const utterance = new SpeechSynthesisUtterance(sampleText);
+        utterance.lang = 'vi-VN';
+        utterance.rate = effectiveRate;
+        utterance.pitch = effectivePitch;
+        utterance.volume = effectiveVolume;
 
-        if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
-          const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-          audioContextRef.current = new AudioContextClass();
-        }
-        if (audioContextRef.current.state === 'suspended') {
-          await audioContextRef.current.resume();
+        if (targetVoice.nativeVoice) {
+          utterance.voice = targetVoice.nativeVoice;
+        } else {
+          const allNative = window.speechSynthesis.getVoices();
+          const vi = allNative.find(
+            (v) =>
+              v.lang.toLowerCase().includes('vi') ||
+              v.name.toLowerCase().includes('viet') ||
+              (targetVoice.gender === 'male' && v.name.toLowerCase().includes('male'))
+          );
+          if (vi) utterance.voice = vi;
         }
 
-        const source = audioContextRef.current.createBufferSource();
-        source.buffer = buffer;
-        source.connect(audioContextRef.current.destination);
-        activeSourceRef.current = source;
         setLoadingVoiceId(null);
         setPreviewingVoiceId(targetVoice.id);
 
-        source.onended = () => {
-          setPreviewingVoiceId(null);
-          activeSourceRef.current = null;
-        };
-        source.start();
-      } else if (targetVoice.engine === 'google-translate' && !isOffline) {
-        const res = await generateGoogleTranslateSpeech(sampleText, targetVoice.id);
-        const buffer = await decodeAudioBase64(res.audioBase64);
-
-        if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
-          const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-          audioContextRef.current = new AudioContextClass();
-        }
-        if (audioContextRef.current.state === 'suspended') {
-          await audioContextRef.current.resume();
-        }
-
-        const ctx = audioContextRef.current;
-        const source = ctx.createBufferSource();
-        source.buffer = buffer;
-
-        const gainNode = ctx.createGain();
-        gainNode.gain.value = effectiveVolume;
-
-        source.playbackRate.value = effectiveRate;
-        source.connect(gainNode);
-        gainNode.connect(ctx.destination);
-        activeSourceRef.current = source;
-        setLoadingVoiceId(null);
-        setPreviewingVoiceId(targetVoice.id);
-
-        source.onended = () => {
-          setPreviewingVoiceId(null);
-          activeSourceRef.current = null;
-        };
-        source.start();
+        utterance.onend = () => setPreviewingVoiceId(null);
+        utterance.onerror = () => setPreviewingVoiceId(null);
+        window.speechSynthesis.speak(utterance);
       } else {
-        // Native browser SpeechSynthesis
-        if ('speechSynthesis' in window) {
-          window.speechSynthesis.cancel();
-          const utterance = new SpeechSynthesisUtterance(sampleText);
-          utterance.lang = 'vi-VN';
-          utterance.rate = effectiveRate;
-          utterance.pitch = effectivePitch;
-          utterance.volume = effectiveVolume;
+        setLoadingVoiceId(null);
+      }
+    };
 
-          if (targetVoice.nativeVoice) {
-            utterance.voice = targetVoice.nativeVoice;
+    try {
+      if (!isStaticHosting() && targetVoice.engine === 'edge' && !isOffline) {
+        try {
+          const res = await generateEdgeSpeech(
+            sampleText,
+            targetVoice.id,
+            effectiveRate,
+            effectivePitch,
+            effectiveVolume
+          );
+          let buffer = await decodeAudioBase64(res.audioBase64);
+
+          if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
+            const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+            audioContextRef.current = new AudioContextClass();
+          }
+          if (audioContextRef.current.state === 'suspended') {
+            await audioContextRef.current.resume();
           }
 
+          const source = audioContextRef.current.createBufferSource();
+          source.buffer = buffer;
+          source.connect(audioContextRef.current.destination);
+          activeSourceRef.current = source;
           setLoadingVoiceId(null);
           setPreviewingVoiceId(targetVoice.id);
 
-          utterance.onend = () => setPreviewingVoiceId(null);
-          utterance.onerror = () => setPreviewingVoiceId(null);
-          window.speechSynthesis.speak(utterance);
-        } else {
-          setLoadingVoiceId(null);
+          source.onended = () => {
+            setPreviewingVoiceId(null);
+            activeSourceRef.current = null;
+          };
+          source.start();
+        } catch {
+          playWithNative();
         }
+      } else if (!isStaticHosting() && targetVoice.engine === 'google-translate' && !isOffline) {
+        try {
+          const res = await generateGoogleTranslateSpeech(sampleText, targetVoice.id);
+          const buffer = await decodeAudioBase64(res.audioBase64);
+
+          if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
+            const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+            audioContextRef.current = new AudioContextClass();
+          }
+          if (audioContextRef.current.state === 'suspended') {
+            await audioContextRef.current.resume();
+          }
+
+          const ctx = audioContextRef.current;
+          const source = ctx.createBufferSource();
+          source.buffer = buffer;
+
+          const gainNode = ctx.createGain();
+          gainNode.gain.value = effectiveVolume;
+
+          source.playbackRate.value = effectiveRate;
+          source.connect(gainNode);
+          gainNode.connect(ctx.destination);
+          activeSourceRef.current = source;
+          setLoadingVoiceId(null);
+          setPreviewingVoiceId(targetVoice.id);
+
+          source.onended = () => {
+            setPreviewingVoiceId(null);
+            activeSourceRef.current = null;
+          };
+          source.start();
+        } catch {
+          playWithNative();
+        }
+      } else {
+        playWithNative();
       }
     } catch (err) {
-      console.error('Preview error:', err);
-      setLoadingVoiceId(null);
-      setPreviewingVoiceId(null);
+      console.warn('Preview fallback:', err);
+      playWithNative();
     }
   };
 

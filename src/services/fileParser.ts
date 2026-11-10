@@ -1,16 +1,5 @@
 import JSZip from 'jszip';
 import mammoth from 'mammoth';
-import * as pdfjsLib from 'pdfjs-dist';
-
-// Configure pdfjs worker
-try {
-  if (typeof window !== 'undefined') {
-    // Set fallback worker URL matching version or unpkg CDN
-    pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
-  }
-} catch (e) {
-  console.warn('Could not set pdf.workerSrc:', e);
-}
 
 export interface ParsedDocumentResult {
   title: string;
@@ -20,12 +9,19 @@ export interface ParsedDocumentResult {
 }
 
 /**
- * Extract text from PDF File using pdfjs-dist
+ * Extract text from PDF File using pdfjs-dist (loaded dynamically to protect iOS Safari)
  */
 export async function parsePdfFile(
   file: File,
   onProgress?: (current: number, total: number) => void
 ): Promise<ParsedDocumentResult> {
+  const pdfjsLib = await import('pdfjs-dist');
+  try {
+    if (typeof window !== 'undefined' && !pdfjsLib.GlobalWorkerOptions.workerSrc) {
+      pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
+    }
+  } catch {}
+
   const arrayBuffer = await file.arrayBuffer();
   const loadingTask = pdfjsLib.getDocument({
     data: new Uint8Array(arrayBuffer),
