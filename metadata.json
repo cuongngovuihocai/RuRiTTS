@@ -1,0 +1,6 @@
+{
+  "name": "VietVoice AudioBook & Reader",
+  "description": "Trình đọc sách và chuyển đổi văn bản sang giọng đọc tiếng Việt truyền cảm, hỗ trợ người khiếm thị, OCR ảnh sách, không giới hạn độ dài và hoạt động offline.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

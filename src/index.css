@@ -1,0 +1,54 @@
+@import "tailwindcss";
+
+:root {
+  --canvas-bg: #0A0A0C;
+  --text-primary: #E0E0E0;
+  --text-secondary: #9E9EA8;
+  --border-color: #2A2A32;
+  --focus-ring: #FFB300;
+}
+
+@layer base {
+  html {
+    font-family: 'Be Vietnam Pro', 'Lexend', system-ui, sans-serif;
+    scroll-behavior: smooth;
+    background-color: var(--canvas-bg);
+    color: var(--text-primary);
+  }
+
+  body {
+    background-color: var(--canvas-bg);
+    color: var(--text-primary);
+    min-height: 100vh;
+    transition: background-color 0.2s ease, color 0.2s ease;
+  }
+
+  /* High contrast focus ring for accessibility */
+  :focus-visible {
+    outline: 3px solid var(--focus-ring, #FFB300) !important;
+    outline-offset: 3px !important;
+    border-radius: 6px;
+  }
+}
+
+/* Custom scrollbars adapting to theme */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--canvas-bg, #0A0A0C);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-color, #2A2A32);
+  border-radius: 5px;
+  border: 2px solid var(--canvas-bg, #0A0A0C);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--focus-ring, #FFB300);
+}
+
+

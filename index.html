@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script>
+      (function() {
+        var suppress = function(e) {
+          var msg = (e && (e.message || (e.reason && e.reason.message))) || '';
+          var file = (e && e.filename) || '';
+          if (
+            (typeof msg === 'string' && (msg.indexOf('WebSocket') !== -1 || msg.indexOf('websocket') !== -1)) ||
+            (typeof file === 'string' && file.indexOf('@vite/client') !== -1)
+          ) {
+            if (e.preventDefault) e.preventDefault();
+            if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+            return true;
+          }
+        };
+        window.addEventListener('error', suppress, true);
+        window.addEventListener('unhandledrejection', suppress, true);
+      })();
+    </script>
+    <title>RÙ RÌ TTS - Đọc bằng Tai</title>
+    <meta name="description" content="RÙ RÌ TTS - Ứng dụng chuyển văn bản thành giọng nói tiếng Việt, nghe và xuất file sách nói, hoạt động offline và online miễn phí." />
+    <meta property="og:title" content="RÙ RÌ TTS" />
+    <meta property="og:description" content="RÙ RÌ TTS - Ứng dụng chuyển văn bản thành giọng nói tiếng Việt, nghe và xuất file sách nói, hoạt động offline và online miễn phí." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+
+    <!-- PWA & Mobile Web App Meta -->
+    <meta name="theme-color" content="#0A0A0C" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="RÙ RÌ TTS" />
+    <link rel="apple-touch-icon" href="apple-touch-icon.png" />
+    <link rel="icon" type="image/png" sizes="192x192" href="pwa-192x192.png" />
+    <link rel="icon" type="image/png" sizes="512x512" href="pwa-512x512.png" />
+    <link rel="shortcut icon" href="favicon.ico" />
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Coiny&family=Grape+Nuts&family=Story+Script&family=Caveat:wght@500;600;700&family=Itim&family=Be+Vietnam+Pro:ital,wght@0,300;0,400;0,500;0,600;0,700;0,800;1,400;1,600&family=Lexend:wght@400;500;600;700;800&family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400;1,700&display=swap" rel="stylesheet">
+  </head>
+  <body class="bg-[#0A0A0C] text-[#E0E0E0] font-sans antialiased selection:bg-[#FFB300] selection:text-[#0A0A0C]">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
