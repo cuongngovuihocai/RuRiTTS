@@ -20,8 +20,6 @@ import {
   Compass,
   Mars,
   Venus,
-  Server,
-  AlertCircle,
 } from 'lucide-react';
 import { EmotionStyle, VietnameseVoice, VoiceSettings, ThemeMode } from '../types';
 import {
@@ -33,13 +31,9 @@ import {
   speakAnnouncement,
 } from '../services/audioSynthesizer';
 import {
-  checkBackendHealth,
   generateEdgeSpeech,
   generateGoogleTranslateSpeech,
-  getConfiguredBackendUrl,
   hasBackendSupport,
-  isStaticHosting,
-  setConfiguredBackendUrl,
 } from '../services/geminiService';
 import { getThemeConfig, HIGHLIGHT_PRESETS, THEME_CONFIGS } from '../utils/themeStyles';
 
@@ -114,16 +108,6 @@ export const VoiceSettingsModal: React.FC<VoiceSettingsModalProps> = ({
   const audioContextRef = useRef<AudioContext | null>(null);
   const activeSourceRef = useRef<AudioBufferSourceNode | null>(null);
 
-  const staticHost = isStaticHosting();
-  const [backendUrlInput, setBackendUrlInput] = useState<string>(() => getConfiguredBackendUrl());
-  const [backendStatus, setBackendStatus] = useState<{
-    state: 'idle' | 'checking' | 'connected' | 'error';
-    message: string;
-  }>(() => ({
-    state: getConfiguredBackendUrl() ? 'connected' : 'idle',
-    message: getConfiguredBackendUrl() ? `Đã kết nối: ${getConfiguredBackendUrl()}` : '',
-  }));
-
   const themeConfig = getThemeConfig(theme as ThemeMode);
   const activeHighlight = voiceSettings.highlightColor || '#f59e0b';
 
@@ -146,44 +130,11 @@ export const VoiceSettingsModal: React.FC<VoiceSettingsModalProps> = ({
   useEffect(() => {
     if (!isOpen) {
       stopCurrentPreview();
-    } else if (staticHost) {
-      const currentUrl = getConfiguredBackendUrl();
-      setBackendUrlInput(currentUrl);
-      if (currentUrl) {
-        setBackendStatus({ state: 'connected', message: `Đã kết nối: ${currentUrl}` });
-      }
     }
     return () => {
       stopCurrentPreview();
     };
-  }, [isOpen, staticHost]);
-
-  const handleSaveBackendUrl = async () => {
-    const trimmed = backendUrlInput.trim();
-    if (!trimmed) {
-      setConfiguredBackendUrl('');
-      setBackendStatus({ state: 'idle', message: 'Đã xóa kết nối Backend. Đang dùng giọng thiết bị.' });
-      return;
-    }
-
-    setBackendStatus({ state: 'checking', message: 'Đang kiểm tra kết nối tới Vercel Backend...' });
-    const result = await checkBackendHealth(trimmed);
-    if (result.ok) {
-      const saved = setConfiguredBackendUrl(result.resolvedUrl);
-      setBackendUrlInput(saved);
-      setBackendStatus({
-        state: 'connected',
-        message: `Kết nối thành công tới ${saved}! Bạn có thể chọn giọng Microsoft Edge & Google Dịch.`,
-      });
-      if (voiceSettings.enableSoundCues) playSoundCue('success');
-    } else {
-      setBackendStatus({
-        state: 'error',
-        message: result.error || 'Không thể kết nối tới địa chỉ Vercel Backend này.',
-      });
-      if (voiceSettings.enableSoundCues) playSoundCue('error');
-    }
-  };
+  }, [isOpen]);
 
   if (!isOpen) return null;
 
@@ -466,61 +417,6 @@ export const VoiceSettingsModal: React.FC<VoiceSettingsModalProps> = ({
                 Đang dùng: {currentVoice?.name}
               </span>
             </div>
-
-            {/* Kết nối Vercel Backend khi chạy trên GitHub Pages */}
-            {staticHost && (
-              <div className={`p-3.5 rounded-2xl ${themeConfig.cardInner} border ${themeConfig.border} space-y-2.5`}>
-                <div className="flex items-center justify-between gap-2">
-                  <div className="flex items-center gap-2 text-xs font-bold" style={{ color: themeConfig.hex.accent }}>
-                    <Server className="w-4 h-4" />
-                    <span>Máy chủ Backend (Vercel API)</span>
-                  </div>
-                  {backendStatus.state === 'connected' && (
-                    <span className="text-[11px] font-bold text-emerald-400">Đang hoạt động</span>
-                  )}
-                </div>
-
-                <div className="flex flex-col sm:flex-row gap-2">
-                  <input
-                    type="url"
-                    value={backendUrlInput}
-                    onChange={(e) => setBackendUrlInput(e.target.value)}
-                    placeholder="https://ruritts.vercel.app"
-                    className={`flex-1 px-3 py-2 rounded-xl text-xs ${themeConfig.card} border ${themeConfig.border} ${themeConfig.textPrimary} focus:outline-none focus:border-amber-400`}
-                  />
-                  <button
-                    type="button"
-                    onClick={handleSaveBackendUrl}
-                    disabled={backendStatus.state === 'checking'}
-                    className={`px-4 py-2 rounded-xl text-xs font-black ${themeConfig.accent} ${themeConfig.accentHover} ${themeConfig.accentText} transition-all active:scale-95 disabled:opacity-60 flex items-center justify-center gap-1.5`}
-                  >
-                    {backendStatus.state === 'checking' ? (
-                      <>
-                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        <span>Đang kiểm tra...</span>
-                      </>
-                    ) : (
-                      <span>Kiểm tra & Lưu</span>
-                    )}
-                  </button>
-                </div>
-
-                {backendStatus.message && (
-                  <p
-                    className={`text-[11px] flex items-center gap-1.5 ${
-                      backendStatus.state === 'error'
-                        ? 'text-rose-400'
-                        : backendStatus.state === 'connected'
-                        ? 'text-emerald-400'
-                        : themeConfig.textSecondary
-                    }`}
-                  >
-                    {backendStatus.state === 'error' && <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />}
-                    <span>{backendStatus.message}</span>
-                  </p>
-                )}
-              </div>
-            )}
 
             {/* Thẻ 1: Microsoft Edge */}
             {!isOffline && edgeVoices.length > 0 && (

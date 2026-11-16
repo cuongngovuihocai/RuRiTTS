@@ -5,7 +5,12 @@ import {defineConfig} from 'vite';
 import { VitePWA } from 'vite-plugin-pwa';
 
 export default defineConfig(() => {
-  const basePath = process.env.VERCEL === '1' ? '/' : '/RuRiTTS/';
+  const isVercel =
+    process.env.VITE_BASE_PATH === '/' ||
+    Boolean(process.env.VERCEL) ||
+    Boolean(process.env.VERCEL_ENV) ||
+    Boolean(process.env.VERCEL_URL);
+  const basePath = process.env.VITE_BASE_PATH || (isVercel ? '/' : '/RuRiTTS/');
   return {
     base: basePath,
     plugins: [

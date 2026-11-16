@@ -586,19 +586,6 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
             </div>
           </div>
 
-          {/* Warning if running on static GitHub Pages without Vercel Backend linked */}
-          {!backendReady && (
-            <div className="p-3.5 rounded-2xl bg-amber-500/10 border border-amber-500/40 text-amber-300 text-xs flex items-start gap-2.5">
-              <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5" />
-              <div>
-                <span className="font-bold block">Chưa kết nối Backend Vercel</span>
-                <span className="opacity-90">
-                  Mở mục <strong>Giọng đọc & Giao diện</strong> và dán đường dẫn Vercel Backend (ví dụ <code>https://ruritts.vercel.app</code>) để xuất file AudioBook MP3/WAV thực tế.
-                </span>
-              </div>
-            </div>
-          )}
-
           {/* Progress / Status Display */}
           {progress.status !== 'idle' && (
             <div className={`space-y-3 p-4 rounded-2xl ${themeConfig.cardInner} border ${themeConfig.border} animate-in fade-in`}>

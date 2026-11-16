@@ -4,7 +4,7 @@ export interface OcrResult {
   error?: string;
 }
 
-const BACKEND_URL_STORAGE_KEY = 'ruri_backend_url';
+const DEFAULT_VERCEL_BACKEND_URL = 'https://ru-ri-tts.vercel.app';
 
 export function isStaticHosting(): boolean {
   if (typeof window === 'undefined') return false;
@@ -28,34 +28,14 @@ export function normalizeBackendUrl(rawUrl: string): string {
 }
 
 export function getConfiguredBackendUrl(): string {
-  try {
-    if (typeof window !== 'undefined' && window.localStorage) {
-      const saved = window.localStorage.getItem(BACKEND_URL_STORAGE_KEY);
-      if (saved && saved.trim()) {
-        return normalizeBackendUrl(saved);
-      }
-    }
-  } catch {}
-
   const envUrl = (import.meta as any)?.env?.VITE_API_BASE_URL;
   if (typeof envUrl === 'string' && envUrl.trim()) {
     return normalizeBackendUrl(envUrl);
   }
+  if (isStaticHosting()) {
+    return DEFAULT_VERCEL_BACKEND_URL;
+  }
   return '';
-}
-
-export function setConfiguredBackendUrl(url: string): string {
-  const normalized = normalizeBackendUrl(url);
-  try {
-    if (typeof window !== 'undefined' && window.localStorage) {
-      if (normalized) {
-        window.localStorage.setItem(BACKEND_URL_STORAGE_KEY, normalized);
-      } else {
-        window.localStorage.removeItem(BACKEND_URL_STORAGE_KEY);
-      }
-    }
-  } catch {}
-  return normalized;
 }
 
 export function hasBackendSupport(): boolean {

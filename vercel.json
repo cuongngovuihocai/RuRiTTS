@@ -1,6 +1,6 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "buildCommand": "npm run build:pages",
+  "buildCommand": "VITE_BASE_PATH=/ npm run build:pages",
   "outputDirectory": "dist",
   "headers": [
     {
