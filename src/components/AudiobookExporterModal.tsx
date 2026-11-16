@@ -14,11 +14,8 @@ import {
 } from 'lucide-react';
 import { Book, VoiceSettings } from '../types';
 import {
-  audioBufferToMp3Blob,
-  audioBufferToWavBlob,
-  base64ToBlob,
-  createMp3BlobFromPcmBase64,
-  createWavBlobFromPcmBase64,
+  concatAudioBuffersToWavBlob,
+  concatMp3Base64Chunks,
   decodeAudioBase64,
   getEmotionAcoustics,
   playSoundCue,
@@ -27,7 +24,7 @@ import {
 import {
   generateEdgeSpeech,
   generateGoogleTranslateSpeech,
-  isStaticHosting,
+  hasBackendSupport,
 } from '../services/geminiService';
 import { ThemeMode } from '../types';
 import { getThemeConfig } from '../utils/themeStyles';
@@ -41,6 +38,68 @@ interface AudiobookExporterModalProps {
   theme?: ThemeMode;
 }
 
+function splitTextForTtsExport(rawText: string, maxChars = 850): string[] {
+  const clean = rawText.trim();
+  if (!clean) return [];
+  if (clean.length <= maxChars) return [clean];
+
+  const blocks = clean.split(/\n+/);
+  const chunks: string[] = [];
+  let current = '';
+
+  const flushCurrent = () => {
+    if (current.trim()) {
+      chunks.push(current.trim());
+      current = '';
+    }
+  };
+
+  for (const block of blocks) {
+    const trimmedBlock = block.trim();
+    if (!trimmedBlock) continue;
+
+    if ((current ? current + ' ' + trimmedBlock : trimmedBlock).length <= maxChars) {
+      current = current ? `${current} ${trimmedBlock}` : trimmedBlock;
+      continue;
+    }
+
+    flushCurrent();
+    if (trimmedBlock.length <= maxChars) {
+      current = trimmedBlock;
+      continue;
+    }
+
+    // Split long paragraph by sentence punctuation without regex lookbehind (iOS Safari compatible)
+    const sentences = trimmedBlock.match(/[^.?!…]+(?:[.?!…]+["'”»)]*)?/g) || [trimmedBlock];
+    for (const sent of sentences) {
+      const s = sent.trim();
+      if (!s) continue;
+      if ((current ? current + ' ' + s : s).length <= maxChars) {
+        current = current ? `${current} ${s}` : s;
+      } else {
+        flushCurrent();
+        if (s.length <= maxChars) {
+          current = s;
+        } else {
+          // Hard split by word boundaries
+          const words = s.split(/\s+/);
+          for (const w of words) {
+            if ((current ? current + ' ' + w : w).length <= maxChars) {
+              current = current ? `${current} ${w}` : w;
+            } else {
+              flushCurrent();
+              current = w;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  flushCurrent();
+  return chunks;
+}
+
 export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
   isOpen,
   onClose,
@@ -51,6 +110,7 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
 }) => {
   const themeConfig = getThemeConfig(theme as ThemeMode);
   const isMultiChapter = book.chapters.length > 1;
+  const backendReady = hasBackendSupport();
   const [exportScope, setExportScope] = useState<'single_full' | 'current' | 'zip_chapters'>(
     isMultiChapter ? 'single_full' : 'current'
   );
@@ -69,80 +129,91 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
 
   const currentChapter = book.chapters[book.currentChapterIndex] || book.chapters[0];
 
-  // Synthesize text to MP3 or WAV Blob using Edge Neural, Google Translate, or Gemini
+  const synthesizeChunkWithRetry = async (
+    chunkText: string,
+    effectiveRate: number,
+    effectivePitch: number,
+    effectiveVolume: number
+  ): Promise<string> => {
+    const preferEdge = voiceSettings.engine === 'edge';
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (preferEdge) {
+        try {
+          const res = await generateEdgeSpeech(
+            chunkText,
+            voiceSettings.voiceId,
+            effectiveRate,
+            effectivePitch,
+            effectiveVolume
+          );
+          if (res?.audioBase64) return res.audioBase64;
+        } catch (err) {
+          if (attempt === 1) {
+            console.warn('Edge chunk export failed after retry, falling back to Google Translate TTS:', err);
+          }
+        }
+      }
+
+      try {
+        const res = await generateGoogleTranslateSpeech(chunkText, voiceSettings.voiceId);
+        if (res?.audioBase64) return res.audioBase64;
+      } catch (gtErr) {
+        if (attempt === 1) {
+          throw gtErr;
+        }
+      }
+
+      await new Promise((r) => setTimeout(r, 400));
+    }
+
+    throw new Error('Không thể tổng hợp đoạn âm thanh từ máy chủ.');
+  };
+
+  // Synthesize text to MP3 or WAV Blob in Vercel-safe chunks (< 850 chars per API call)
   const synthesizeTextToAudio = async (
     text: string,
-    format: 'mp3' | 'wav'
+    format: 'mp3' | 'wav',
+    onChunkProgress?: (done: number, total: number) => void
   ): Promise<Blob> => {
     const emotionAcoustics = getEmotionAcoustics(voiceSettings.emotion);
     const effectiveRate = Math.max(0.5, Math.min(3.0, voiceSettings.rate * emotionAcoustics.rateMultiplier));
     const effectivePitch = Math.max(0.5, Math.min(1.5, voiceSettings.pitch * emotionAcoustics.pitchMultiplier));
     const effectiveVolume = Math.max(0, Math.min(1.0, voiceSettings.volume * emotionAcoustics.volumeMultiplier));
 
-    if (!isStaticHosting() && voiceSettings.engine === 'edge' && !isOffline) {
-      try {
-        const res = await generateEdgeSpeech(
-          text,
-          voiceSettings.voiceId,
-          effectiveRate,
-          effectivePitch,
-          effectiveVolume
-        );
-        if (format === 'mp3') {
-          return base64ToBlob(res.audioBase64, 'audio/mp3');
-        } else {
-          const buffer = await decodeAudioBase64(res.audioBase64);
-          return audioBufferToWavBlob(buffer);
-        }
-      } catch (err) {
-        console.warn('Edge TTS export failed, falling back to Google Translate TTS:', err);
-        try {
-          const res = await generateGoogleTranslateSpeech(text);
-          if (format === 'mp3') {
-            return base64ToBlob(res.audioBase64, 'audio/mp3');
-          } else {
-            const buffer = await decodeAudioBase64(res.audioBase64);
-            return audioBufferToWavBlob(buffer);
-          }
-        } catch {}
-      }
+    if (!backendReady) {
+      throw new Error('Chưa kết nối máy chủ Backend (Vercel). Vui lòng mở "Giọng đọc & Giao diện" để dán link Vercel Backend trước khi xuất file âm thanh.');
     }
 
-    if (!isStaticHosting() && voiceSettings.engine === 'google-translate' && !isOffline) {
-      try {
-        const res = await generateGoogleTranslateSpeech(text);
-        if (format === 'mp3') {
-          return base64ToBlob(res.audioBase64, 'audio/mp3');
-        } else {
-          const buffer = await decodeAudioBase64(res.audioBase64);
-          return audioBufferToWavBlob(buffer);
-        }
-      } catch {}
+    if (isOffline) {
+      throw new Error('Thiết bị đang ngoại tuyến (Offline). Vui lòng kết nối Internet để xuất file Audio MP3/WAV.');
     }
 
-    // Offline / Native Synthesizer fallback
-    const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-    const ctx = new AudioContextClass();
-    const duration = Math.max(2, (text.split(/\s+/).length / (180 * voiceSettings.rate)) * 60);
-    const sampleRate = 24000;
-    const buffer = ctx.createBuffer(1, Math.floor(sampleRate * duration), sampleRate);
-    const data = buffer.getChannelData(0);
+    const chunks = splitTextForTtsExport(text, 850);
+    if (chunks.length === 0) {
+      throw new Error('Nội dung văn bản trống, không thể tạo file âm thanh.');
+    }
 
-    for (let i = 0; i < data.length; i++) {
-      const t = i / sampleRate;
-      const f0 = 140 * (1 + 0.1 * Math.sin(2 * Math.PI * 1.5 * t));
-      const val =
-        0.3 * Math.sin(2 * Math.PI * f0 * t) +
-        0.2 * Math.sin(2 * Math.PI * f0 * 2 * t) +
-        0.1 * Math.sin(2 * Math.PI * f0 * 3 * t);
-      const env = Math.sin((Math.PI * i) / data.length);
-      data[i] = val * env;
+    const base64Chunks: string[] = [];
+    for (let i = 0; i < chunks.length; i++) {
+      onChunkProgress?.(i, chunks.length);
+      const b64 = await synthesizeChunkWithRetry(
+        chunks[i],
+        effectiveRate,
+        effectivePitch,
+        effectiveVolume
+      );
+      base64Chunks.push(b64);
+      onChunkProgress?.(i + 1, chunks.length);
     }
 
     if (format === 'mp3') {
-      return audioBufferToMp3Blob(buffer);
+      return concatMp3Base64Chunks(base64Chunks);
     } else {
-      return audioBufferToWavBlob(buffer);
+      const buffers: AudioBuffer[] = [];
+      for (const b64 of base64Chunks) {
+        buffers.push(await decodeAudioBase64(b64));
+      }
+      return concatAudioBuffersToWavBlob(buffers);
     }
   };
 
@@ -177,22 +248,21 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
 
     try {
       if (exportScope === 'single_full') {
-        // 1. Export ENTIRE book as 1 single seamless audio file
-        setProgress({
-          status: 'generating',
-          currentChapter: 1,
-          totalChapters: 1,
-          message: `Đang kết xuất toàn bộ bài đọc thành 1 file .${fileExt.toUpperCase()} duy nhất...`,
-          downloadUrl: '',
-          fileName: '',
-        });
-
-        // Combine all chapters text
         const fullText = book.chapters
           .map((c) => c.sentences.map((s) => s.text).join(' '))
           .join('\n\n');
 
-        const audioBlob = await synthesizeTextToAudio(fullText, exportFormat);
+        const audioBlob = await synthesizeTextToAudio(fullText, exportFormat, (done, total) => {
+          setProgress({
+            status: 'generating',
+            currentChapter: done,
+            totalChapters: total,
+            message: `Đang kết xuất đoạn ${done}/${total} thành file .${fileExt.toUpperCase()}...`,
+            downloadUrl: '',
+            fileName: '',
+          });
+        });
+
         const url = URL.createObjectURL(audioBlob);
         const fileName = `${safeTitle}.${fileExt}`;
 
@@ -208,21 +278,20 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
         triggerAutoDownload(url, fileName);
         if (voiceSettings.enableSoundCues) playSoundCue('success');
       } else if (exportScope === 'current') {
-        // 2. Export ONLY the current chapter
         const chapter = currentChapter;
         const safeChapterTitle = sanitizeFileName(chapter.title);
-
-        setProgress({
-          status: 'generating',
-          currentChapter: 1,
-          totalChapters: 1,
-          message: `Đang tạo file âm thanh chương: "${chapter.title}"...`,
-          downloadUrl: '',
-          fileName: '',
-        });
-
         const textContent = chapter.sentences.map((s) => s.text).join(' ');
-        const audioBlob = await synthesizeTextToAudio(textContent, exportFormat);
+
+        const audioBlob = await synthesizeTextToAudio(textContent, exportFormat, (done, total) => {
+          setProgress({
+            status: 'generating',
+            currentChapter: done,
+            totalChapters: total,
+            message: `Đang tạo đoạn ${done}/${total} chương "${chapter.title}"...`,
+            downloadUrl: '',
+            fileName: '',
+          });
+        });
 
         const url = URL.createObjectURL(audioBlob);
         const fileName = `${safeTitle}_${safeChapterTitle}.${fileExt}`;
@@ -516,6 +585,19 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
               </span>
             </div>
           </div>
+
+          {/* Warning if running on static GitHub Pages without Vercel Backend linked */}
+          {!backendReady && (
+            <div className="p-3.5 rounded-2xl bg-amber-500/10 border border-amber-500/40 text-amber-300 text-xs flex items-start gap-2.5">
+              <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+              <div>
+                <span className="font-bold block">Chưa kết nối Backend Vercel</span>
+                <span className="opacity-90">
+                  Mở mục <strong>Giọng đọc & Giao diện</strong> và dán đường dẫn Vercel Backend (ví dụ <code>https://ruritts.vercel.app</code>) để xuất file AudioBook MP3/WAV thực tế.
+                </span>
+              </div>
+            </div>
+          )}
 
           {/* Progress / Status Display */}
           {progress.status !== 'idle' && (

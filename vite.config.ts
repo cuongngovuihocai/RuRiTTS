@@ -5,8 +5,9 @@ import {defineConfig} from 'vite';
 import { VitePWA } from 'vite-plugin-pwa';
 
 export default defineConfig(() => {
+  const basePath = process.env.VERCEL === '1' ? '/' : '/RuRiTTS/';
   return {
-    base: '/RuRiTTS/',
+    base: basePath,
     plugins: [
       react(),
       tailwindcss(),
@@ -22,7 +23,7 @@ export default defineConfig(() => {
           'hamchoi-logo-light.png',
         ],
         manifest: {
-          id: '/RuRiTTS/',
+          id: basePath,
           name: 'RÙ RÌ TTS - Trình đọc sách nói tiếng Việt',
           short_name: 'RÙ RÌ TTS',
           description: 'Trình đọc sách và chuyển đổi văn bản sang giọng đọc tiếng Việt truyền cảm, hoạt động offline.',
@@ -30,8 +31,8 @@ export default defineConfig(() => {
           background_color: '#0A0A0C',
           display: 'standalone',
           orientation: 'portrait',
-          start_url: '/RuRiTTS/',
-          scope: '/RuRiTTS/',
+          start_url: basePath,
+          scope: basePath,
           icons: [
             {
               src: 'pwa-192x192.png',

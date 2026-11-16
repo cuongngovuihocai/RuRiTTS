@@ -4,16 +4,111 @@ export interface OcrResult {
   error?: string;
 }
 
+const BACKEND_URL_STORAGE_KEY = 'ruri_backend_url';
+
 export function isStaticHosting(): boolean {
   if (typeof window === 'undefined') return false;
   const host = window.location.hostname;
   return (
     host.endsWith('github.io') ||
     host.endsWith('pages.dev') ||
-    host.endsWith('vercel.app') ||
     host.endsWith('netlify.app') ||
-    (window.location.protocol === 'file:')
+    window.location.protocol === 'file:'
   );
+}
+
+export function normalizeBackendUrl(rawUrl: string): string {
+  const trimmed = rawUrl.trim();
+  if (!trimmed) return '';
+  let withProto = trimmed;
+  if (!/^https?:\/\//i.test(withProto)) {
+    withProto = `https://${withProto}`;
+  }
+  return withProto.replace(/\/+$/, '').replace(/\/api$/i, '');
+}
+
+export function getConfiguredBackendUrl(): string {
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      const saved = window.localStorage.getItem(BACKEND_URL_STORAGE_KEY);
+      if (saved && saved.trim()) {
+        return normalizeBackendUrl(saved);
+      }
+    }
+  } catch {}
+
+  const envUrl = (import.meta as any)?.env?.VITE_API_BASE_URL;
+  if (typeof envUrl === 'string' && envUrl.trim()) {
+    return normalizeBackendUrl(envUrl);
+  }
+  return '';
+}
+
+export function setConfiguredBackendUrl(url: string): string {
+  const normalized = normalizeBackendUrl(url);
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      if (normalized) {
+        window.localStorage.setItem(BACKEND_URL_STORAGE_KEY, normalized);
+      } else {
+        window.localStorage.removeItem(BACKEND_URL_STORAGE_KEY);
+      }
+    }
+  } catch {}
+  return normalized;
+}
+
+export function hasBackendSupport(): boolean {
+  return !isStaticHosting() || Boolean(getConfiguredBackendUrl());
+}
+
+export function getApiEndpoint(path: string): string | null {
+  const cleanPath = path.startsWith('/') ? path : `/${path}`;
+  const configuredBase = getConfiguredBackendUrl();
+  if (configuredBase) {
+    return `${configuredBase}${cleanPath}`;
+  }
+  if (!isStaticHosting()) {
+    return cleanPath;
+  }
+  return null;
+}
+
+export async function checkBackendHealth(testUrl?: string): Promise<{
+  ok: boolean;
+  resolvedUrl: string;
+  error?: string;
+}> {
+  const base = testUrl !== undefined ? normalizeBackendUrl(testUrl) : getConfiguredBackendUrl();
+  const endpoint = base ? `${base}/api/health` : !isStaticHosting() ? '/api/health' : '';
+  if (!endpoint) {
+    return { ok: false, resolvedUrl: '', error: 'Chưa nhập địa chỉ Backend Vercel.' };
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 7000);
+  try {
+    const res = await fetch(endpoint, { method: 'GET', signal: controller.signal });
+    clearTimeout(timer);
+    if (!res.ok) {
+      return { ok: false, resolvedUrl: base, error: `Máy chủ phản hồi mã lỗi ${res.status}.` };
+    }
+    const contentType = res.headers.get('content-type') || '';
+    if (!contentType.includes('application/json')) {
+      return { ok: false, resolvedUrl: base, error: 'Đường dẫn này không phải Backend API (không trả về JSON).' };
+    }
+    const data = await res.json();
+    if (data?.ok) {
+      return { ok: true, resolvedUrl: base };
+    }
+    return { ok: false, resolvedUrl: base, error: 'Backend không trả về trạng thái hợp lệ.' };
+  } catch (err: any) {
+    clearTimeout(timer);
+    if (err?.name === 'AbortError') {
+      return { ok: false, resolvedUrl: base, error: 'Quá thời gian kết nối tới Backend (Timeout).' };
+    }
+    return { ok: false, resolvedUrl: base, error: err?.message || 'Không thể kết nối tới Backend.' };
+  }
 }
 
 async function safeParseJson(res: Response, fallbackError: string): Promise<any> {
@@ -40,12 +135,13 @@ export async function generateEdgeSpeech(
   fallbackVoiceName?: string;
   fallbackReason?: string;
 }> {
-  if (isStaticHosting()) {
-    throw new Error('STATIC_HOSTING: Máy chủ tĩnh (GitHub Pages) không hỗ trợ backend API. Tự động chuyển sang giọng đọc thiết bị.');
+  const endpoint = getApiEndpoint('/api/tts/edge');
+  if (!endpoint) {
+    throw new Error('STATIC_HOSTING: Chưa kết nối máy chủ Backend Vercel. Tự động chuyển sang giọng đọc thiết bị.');
   }
 
   try {
-    const res = await fetch('/api/tts/edge', {
+    const res = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text, voice, rate, pitch, volume }),
@@ -78,12 +174,13 @@ export async function generateGoogleTranslateSpeech(
   text: string,
   voice: string = 'google_translate_vi'
 ): Promise<{ audioBase64: string; sampleRate: number; mimeType: string }> {
-  if (isStaticHosting()) {
-    throw new Error('STATIC_HOSTING: Máy chủ tĩnh (GitHub Pages) không hỗ trợ backend API. Tự động chuyển sang giọng đọc thiết bị.');
+  const endpoint = getApiEndpoint('/api/tts/google-translate');
+  if (!endpoint) {
+    throw new Error('STATIC_HOSTING: Chưa kết nối máy chủ Backend Vercel. Tự động chuyển sang giọng đọc thiết bị.');
   }
 
   try {
-    const res = await fetch('/api/tts/google-translate', {
+    const res = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text, voice }),
@@ -290,21 +387,20 @@ export async function fetchWebArticle(url: string): Promise<{
   url: string;
   wordCount: number;
 }> {
-  // If running on GitHub Pages or static host, extract client-side immediately
-  if (isStaticHosting()) {
+  const endpoint = getApiEndpoint('/api/fetch-url');
+  if (!endpoint) {
     return await extractArticleClientSide(url);
   }
 
-  // Try local server first if available, with automatic fallback to client-side
+  // Try configured backend server first, with automatic fallback to client-side extractor
   try {
-    const res = await fetch('/api/fetch-url', {
+    const res = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url }),
     });
 
     if (res.status === 405 || res.status === 404) {
-      // Backend not running (static deployment) -> Fallback to client-side
       return await extractArticleClientSide(url);
     }
 
@@ -315,7 +411,7 @@ export async function fetchWebArticle(url: string): Promise<{
 
     return data;
   } catch (error: any) {
-    console.warn('Backend fetch-url failed or 405, falling back to client-side extractor:', error?.message);
+    console.warn('Backend fetch-url failed, falling back to client-side extractor:', error?.message);
     return await extractArticleClientSide(url);
   }
 }

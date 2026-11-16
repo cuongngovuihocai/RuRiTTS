@@ -19,6 +19,11 @@ const PORT = 3000;
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
+// 0. Health Check
+app.get('/api/health', (req, res) => {
+  res.json({ ok: true, service: 'ruri-tts-express-backend', timestamp: Date.now() });
+});
+
 // 1. Web URL Article Extractor
 app.post('/api/fetch-url', async (req, res) => {
   try {

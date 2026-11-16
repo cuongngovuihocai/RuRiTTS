@@ -39,8 +39,10 @@ import {
   speakAnnouncement,
 } from './services/audioSynthesizer';
 import {
+  checkBackendHealth,
   generateEdgeSpeech,
   generateGoogleTranslateSpeech,
+  hasBackendSupport,
   isStaticHosting,
 } from './services/geminiService';
 
@@ -158,9 +160,9 @@ export default function App() {
         }
       }
 
-      // On static hosting (GitHub Pages), backend TTS endpoints return 405.
-      // Return null immediately so App.tsx plays using native browser SpeechSynthesis instantly with zero delay!
-      if (isStaticHosting()) {
+      // On static hosting without a linked backend URL, return null immediately
+      // so App.tsx plays using native browser SpeechSynthesis instantly with zero delay.
+      if (!hasBackendSupport()) {
         return null;
       }
 
@@ -346,15 +348,21 @@ export default function App() {
       const detectedVoices = await getAvailableVietnameseVoices();
       setVoices(detectedVoices);
 
-      // Pick default voice if not set or invalid, or on static hosting without server
+      // Pick default voice if not set or invalid, or when no backend is configured on static hosting
+      const backendReady = hasBackendSupport();
+      if (backendReady && isStaticHosting()) {
+        // Warm up external Vercel backend silently in background
+        checkBackendHealth().catch(() => {});
+      }
+
       const shouldPickDefault =
         !savedVoiceSettings.voiceId ||
         savedVoiceSettings.voiceId === 'native_default_vi' ||
         isDeprecatedId ||
-        (isStaticHosting() && savedVoiceSettings.engine !== 'native');
+        (!backendReady && savedVoiceSettings.engine !== 'native');
 
       if (shouldPickDefault) {
-        const defaultVoice = isStaticHosting()
+        const defaultVoice = !backendReady
           ? detectedVoices.find((v) => v.engine === 'native') || detectedVoices[0]
           : detectedVoices.find((v) => v.id === DEFAULT_SETTINGS.voiceId) || detectedVoices[0];
 

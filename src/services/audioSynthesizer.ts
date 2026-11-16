@@ -575,3 +575,63 @@ export function createMp3BlobFromPcmBase64(base64Pcm: string, sampleRate = 24000
   const buffer = pcmToAudioBuffer(base64Pcm, sampleRate);
   return audioBufferToMp3Blob(buffer);
 }
+
+function base64ToUint8Array(base64Data: string): Uint8Array {
+  const binaryString = window.atob(base64Data);
+  const len = binaryString.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes;
+}
+
+function stripLeadingId3v2Tag(bytes: Uint8Array): Uint8Array {
+  if (bytes.length > 10 && bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33) {
+    // ID3v2 syncsafe size in bytes 6..9
+    const size =
+      ((bytes[6] & 0x7f) << 21) |
+      ((bytes[7] & 0x7f) << 14) |
+      ((bytes[8] & 0x7f) << 7) |
+      (bytes[9] & 0x7f);
+    const offset = 10 + size;
+    if (offset < bytes.length) {
+      return bytes.subarray(offset);
+    }
+  }
+  return bytes;
+}
+
+export function concatMp3Base64Chunks(base64Chunks: string[]): Blob {
+  const parts: BlobPart[] = base64Chunks.map((chunk, idx) => {
+    const raw = base64ToUint8Array(chunk);
+    const cleaned = idx === 0 ? raw : stripLeadingId3v2Tag(raw);
+    return new Uint8Array(cleaned);
+  });
+  return new Blob(parts, { type: 'audio/mp3' });
+}
+
+export function concatAudioBuffersToWavBlob(buffers: AudioBuffer[]): Blob {
+  if (buffers.length === 0) {
+    throw new Error('Không có dữ liệu âm thanh để ghép file WAV.');
+  }
+  if (buffers.length === 1) {
+    return audioBufferToWavBlob(buffers[0]);
+  }
+
+  const ctx = getAudioContext();
+  const sampleRate = buffers[0].sampleRate;
+  const totalLength = buffers.reduce((sum, b) => sum + b.length, 0);
+  const merged = ctx.createBuffer(1, totalLength, sampleRate);
+  const out = merged.getChannelData(0);
+
+  let offset = 0;
+  for (const buf of buffers) {
+    const ch = buf.getChannelData(0);
+    out.set(ch, offset);
+    offset += ch.length;
+  }
+
+  return audioBufferToWavBlob(merged);
+}
+
