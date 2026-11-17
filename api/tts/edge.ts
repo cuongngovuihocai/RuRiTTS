@@ -17,15 +17,30 @@ export default async function handler(req: any, res: any) {
       rate = 1.0,
       pitch = 1.0,
       volume = 1.0,
+      strict = false,
     } = body || {};
 
     if (!text || typeof text !== 'string' || !text.trim()) {
       return res.status(400).json({ error: 'Nội dung đọc không được để trống.', success: false });
     }
 
-    const resultObj = await synthesizeEdgeSpeechPayload({ text, voice, rate, pitch, volume });
+    const resultObj = await synthesizeEdgeSpeechPayload({
+      text,
+      voice,
+      rate,
+      pitch,
+      volume,
+      strict: Boolean(strict),
+    });
     return res.status(200).json(resultObj);
   } catch (error: any) {
+    if (body?.strict) {
+      return res.status(502).json({
+        error: error?.message || 'Không thể kết nối giọng Microsoft Edge trong chế độ khóa cứng giọng.',
+        success: false,
+      });
+    }
+
     try {
       const cleanText = (body?.text || '').trim();
       if (cleanText) {

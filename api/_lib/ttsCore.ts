@@ -564,6 +564,7 @@ export async function synthesizeEdgeSpeechPayload(params: {
   rate?: number;
   pitch?: number;
   volume?: number;
+  strict?: boolean;
 }) {
   const {
     text,
@@ -571,30 +572,35 @@ export async function synthesizeEdgeSpeechPayload(params: {
     rate = 1.0,
     pitch = 1.0,
     volume = 1.0,
+    strict = false,
   } = params;
 
   const cleanText = text.trim();
-  const cacheKey = `edge_${voice}_${rate}_${pitch}_${volume}_${cleanText}`;
+  const cacheKey = `edge_${strict ? 'strict_' : ''}${voice}_${rate}_${pitch}_${volume}_${cleanText}`;
   if (ttsAudioCache.has(cacheKey)) {
     return ttsAudioCache.get(cacheKey)!;
   }
 
+  const maxChunkChars = strict ? 550 : 1000;
+  const maxSentChars = strict ? 500 : 900;
+  const maxWordChunkChars = strict ? 450 : 800;
+
   const chunks: string[] = [];
-  if (cleanText.length <= 1000) {
+  if (cleanText.length <= maxChunkChars) {
     chunks.push(cleanText);
   } else {
     const sentences = cleanText.split(/(?<=[.?!;\n])\s+/);
     let currentChunk = '';
     for (const sent of sentences) {
-      if ((currentChunk + ' ' + sent).trim().length <= 900) {
+      if ((currentChunk + ' ' + sent).trim().length <= maxSentChars) {
         currentChunk = (currentChunk + ' ' + sent).trim();
       } else {
         if (currentChunk) chunks.push(currentChunk);
-        if (sent.length > 900) {
+        if (sent.length > maxSentChars) {
           const words = sent.split(/\s+/);
           let sub = '';
           for (const w of words) {
-            if ((sub + ' ' + w).trim().length <= 800) {
+            if ((sub + ' ' + w).trim().length <= maxWordChunkChars) {
               sub = (sub + ' ' + w).trim();
             } else {
               if (sub) chunks.push(sub);
@@ -613,19 +619,38 @@ export async function synthesizeEdgeSpeechPayload(params: {
 
   const audioBuffers: Buffer[] = [];
   let usedGoogleFallback = false;
+  const edgeTimeoutMs = strict ? 9000 : 6500;
 
   for (const chunk of chunks) {
     if (!chunk.trim()) continue;
+    let edgeBuffer: Buffer | null = null;
+    let lastEdgeError: unknown = null;
+
     try {
-      const buf = await synthesizeEdgeDirect(chunk, voice, pitch, rate, volume, 6500);
-      if (buf && buf.length > 0) {
-        audioBuffers.push(buf);
-        continue;
+      edgeBuffer = await synthesizeEdgeDirect(chunk, voice, pitch, rate, volume, edgeTimeoutMs);
+    } catch (err) {
+      lastEdgeError = err;
+      if (strict) {
+        await new Promise((r) => setTimeout(r, 350));
+        try {
+          edgeBuffer = await synthesizeEdgeDirect(chunk, voice, pitch, rate, volume, edgeTimeoutMs);
+        } catch (retryErr) {
+          lastEdgeError = retryErr;
+        }
       }
-    } catch {
-      // Fallback to Google Translate TTS
     }
 
+    if (edgeBuffer && edgeBuffer.length > 0) {
+      audioBuffers.push(edgeBuffer);
+      continue;
+    }
+
+    if (strict) {
+      const reason = lastEdgeError instanceof Error ? lastEdgeError.message : 'Timeout/WebSocket closed';
+      throw new Error(`Không thể kết nối giọng Microsoft Edge (${reason}). Đã dừng để tránh lẫn giọng khác.`);
+    }
+
+    // Fallback to Google Translate TTS (live reading mode only)
     try {
       const fb = await fetchGoogleTranslateAudio(chunk);
       if (fb && fb.length > 0) {
@@ -636,9 +661,16 @@ export async function synthesizeEdgeSpeechPayload(params: {
   }
 
   if (audioBuffers.length === 0) {
+    if (strict) {
+      throw new Error('Không nhận được dữ liệu âm thanh từ giọng Microsoft Edge đã chọn.');
+    }
     const fb = await fetchGoogleTranslateAudio(cleanText);
     audioBuffers.push(fb);
     usedGoogleFallback = true;
+  }
+
+  if (strict && usedGoogleFallback) {
+    throw new Error('Phát hiện giọng dự phòng trong chế độ khóa cứng giọng Edge.');
   }
 
   const fullAudioBuffer = Buffer.concat(audioBuffers);
@@ -665,32 +697,53 @@ export async function synthesizeEdgeSpeechPayload(params: {
 export async function synthesizeGoogleTranslatePayload(params: {
   text: string;
   voice?: string;
+  strict?: boolean;
 }) {
-  const { text, voice = 'google_translate_vi' } = params;
+  const { text, voice = 'google_translate_vi', strict = false } = params;
   const cleanText = text.trim();
-  const cacheKey = `gt_${voice}_${cleanText}`;
+  const cacheKey = `gt_${strict ? 'strict_' : ''}${voice}_${cleanText}`;
   if (ttsAudioCache.has(cacheKey)) {
     return ttsAudioCache.get(cacheKey)!;
   }
 
   let fullAudioBuffer: Buffer;
   if (voice === 'google_translate_vi_south_male' || voice.includes('south_male')) {
-    try {
-      fullAudioBuffer = await synthesizeEdgeDirect(cleanText, 'vi-VN-NamMinhNeural', 1.0, 0.96, 1.0);
-    } catch {
-      fullAudioBuffer = await fetchGoogleTranslateAudio(cleanText);
+    if (strict) {
+      fullAudioBuffer = await synthesizeEdgeDirect(cleanText, 'vi-VN-NamMinhNeural', 1.0, 0.96, 1.0, 9000);
+    } else {
+      try {
+        fullAudioBuffer = await synthesizeEdgeDirect(cleanText, 'vi-VN-NamMinhNeural', 1.0, 0.96, 1.0);
+      } catch {
+        fullAudioBuffer = await fetchGoogleTranslateAudio(cleanText);
+      }
     }
   } else if (voice === 'google_translate_vi_south_female' || voice.includes('south_female')) {
-    try {
-      fullAudioBuffer = await synthesizeEdgeDirect(cleanText, 'vi-VN-MaiLinh-Southern', 1.0, 1.0, 1.0);
-    } catch {
-      fullAudioBuffer = await fetchGoogleTranslateAudio(cleanText);
+    if (strict) {
+      fullAudioBuffer = await synthesizeEdgeDirect(cleanText, 'vi-VN-MaiLinh-Southern', 1.0, 1.0, 1.0, 9000);
+    } else {
+      try {
+        fullAudioBuffer = await synthesizeEdgeDirect(cleanText, 'vi-VN-MaiLinh-Southern', 1.0, 1.0, 1.0);
+      } catch {
+        fullAudioBuffer = await fetchGoogleTranslateAudio(cleanText);
+      }
     }
   } else {
-    try {
-      fullAudioBuffer = await fetchGoogleTranslateAudio(cleanText);
-    } catch {
-      fullAudioBuffer = await synthesizeEdgeDirect(cleanText, 'vi-VN-HoaiMyNeural', 1.0, 1.0, 1.0);
+    if (strict) {
+      try {
+        fullAudioBuffer = await fetchGoogleTranslateAudio(cleanText);
+      } catch {
+        await new Promise((r) => setTimeout(r, 300));
+        fullAudioBuffer = await fetchGoogleTranslateAudio(cleanText);
+      }
+      if (!fullAudioBuffer || fullAudioBuffer.length === 0) {
+        throw new Error('Không nhận được dữ liệu âm thanh từ Google Dịch TTS.');
+      }
+    } else {
+      try {
+        fullAudioBuffer = await fetchGoogleTranslateAudio(cleanText);
+      } catch {
+        fullAudioBuffer = await synthesizeEdgeDirect(cleanText, 'vi-VN-HoaiMyNeural', 1.0, 1.0, 1.0);
+      }
     }
   }
 
@@ -699,6 +752,7 @@ export async function synthesizeGoogleTranslatePayload(params: {
     mimeType: 'audio/mp3',
     sampleRate: 24000,
     voice,
+    isFallback: false,
     success: true,
   };
 

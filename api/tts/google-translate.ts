@@ -15,15 +15,26 @@ export default async function handler(req: any, res: any) {
   let body: any = {};
   try {
     body = await readJsonBody(req);
-    const { text, voice = 'google_translate_vi' } = body || {};
+    const { text, voice = 'google_translate_vi', strict = false } = body || {};
 
     if (!text || typeof text !== 'string' || !text.trim()) {
       return res.status(400).json({ error: 'Nội dung đọc không được để trống.', success: false });
     }
 
-    const resultObj = await synthesizeGoogleTranslatePayload({ text, voice });
+    const resultObj = await synthesizeGoogleTranslatePayload({
+      text,
+      voice,
+      strict: Boolean(strict),
+    });
     return res.status(200).json(resultObj);
   } catch (error: any) {
+    if (body?.strict) {
+      return res.status(502).json({
+        error: error?.message || 'Không thể kết nối giọng Google Dịch TTS trong chế độ khóa cứng giọng.',
+        success: false,
+      });
+    }
+
     try {
       const cleanText = (body?.text || '').trim();
       if (cleanText) {

@@ -106,7 +106,8 @@ export async function generateEdgeSpeech(
   voice: string = 'vi-VN-HoaiMyNeural',
   rate: number = 1.0,
   pitch: number = 1.0,
-  volume: number = 1.0
+  volume: number = 1.0,
+  options?: { strict?: boolean }
 ): Promise<{
   audioBase64: string;
   sampleRate: number;
@@ -120,11 +121,13 @@ export async function generateEdgeSpeech(
     throw new Error('STATIC_HOSTING: Chưa kết nối máy chủ Backend Vercel. Tự động chuyển sang giọng đọc thiết bị.');
   }
 
+  const strict = Boolean(options?.strict);
+
   try {
     const res = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, voice, rate, pitch, volume }),
+      body: JSON.stringify({ text, voice, rate, pitch, volume, strict }),
     });
 
     if (res.status === 405 || res.status === 404) {
@@ -134,6 +137,10 @@ export async function generateEdgeSpeech(
     const data = await safeParseJson(res, 'Lỗi tạo giọng đọc Microsoft Edge');
     if (!res.ok || !data.success) {
       throw new Error(data.error || 'Lỗi tạo giọng đọc Microsoft Edge.');
+    }
+
+    if (strict && data.isFallback) {
+      throw new Error('Máy chủ trả về giọng dự phòng thay vì giọng Microsoft Edge đã chọn. Đã dừng để tránh lẫn giọng.');
     }
 
     return {
@@ -152,18 +159,21 @@ export async function generateEdgeSpeech(
 
 export async function generateGoogleTranslateSpeech(
   text: string,
-  voice: string = 'google_translate_vi'
-): Promise<{ audioBase64: string; sampleRate: number; mimeType: string }> {
+  voice: string = 'google_translate_vi',
+  options?: { strict?: boolean }
+): Promise<{ audioBase64: string; sampleRate: number; mimeType: string; isFallback?: boolean }> {
   const endpoint = getApiEndpoint('/api/tts/google-translate');
   if (!endpoint) {
     throw new Error('STATIC_HOSTING: Chưa kết nối máy chủ Backend Vercel. Tự động chuyển sang giọng đọc thiết bị.');
   }
 
+  const strict = Boolean(options?.strict);
+
   try {
     const res = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, voice }),
+      body: JSON.stringify({ text, voice, strict }),
     });
 
     if (res.status === 405 || res.status === 404) {
@@ -175,10 +185,15 @@ export async function generateGoogleTranslateSpeech(
       throw new Error(data.error || 'Lỗi tạo giọng đọc Google Translate TTS.');
     }
 
+    if (strict && data.isFallback) {
+      throw new Error('Máy chủ trả về giọng dự phòng thay vì Google Dịch TTS. Đã dừng để tránh lẫn giọng.');
+    }
+
     return {
       audioBase64: data.audioBase64,
       sampleRate: data.sampleRate || 24000,
       mimeType: data.mimeType || 'audio/mp3',
+      isFallback: data.isFallback,
     };
   } catch (error: any) {
     console.warn('Google Translate TTS API warning:', error?.message);

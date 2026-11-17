@@ -719,35 +719,41 @@ app.post('/api/tts/edge', async (req, res) => {
       rate = 1.0,
       pitch = 1.0,
       volume = 1.0,
+      strict = false,
     } = req.body;
 
     if (!text || typeof text !== 'string') {
-      return res.status(400).json({ error: 'Nội dung đọc không được để trống.' });
+      return res.status(400).json({ error: 'Nội dung đọc không được để trống.', success: false });
     }
 
-    const cacheKey = `edge_${voice}_${rate}_${pitch}_${volume}_${text.trim()}`;
+    const isStrict = Boolean(strict);
+    const cacheKey = `edge_${isStrict ? 'strict_' : ''}${voice}_${rate}_${pitch}_${volume}_${text.trim()}`;
     if (ttsAudioCache.has(cacheKey)) {
       return res.json(ttsAudioCache.get(cacheKey));
     }
 
     const cleanText = text.trim();
-    // Split into chunks of ~1000 chars at sentence punctuation for reliable Edge TTS streaming
+    const maxChunkChars = isStrict ? 550 : 1200;
+    const maxSentChars = isStrict ? 500 : 1000;
+    const maxWordChunkChars = isStrict ? 450 : 800;
+
+    // Split into chunks at sentence punctuation for reliable Edge TTS streaming
     const chunks: string[] = [];
-    if (cleanText.length <= 1200) {
+    if (cleanText.length <= maxChunkChars) {
       chunks.push(cleanText);
     } else {
       const sentences = cleanText.split(/(?<=[.?!;\n])\s+/);
       let currentChunk = '';
       for (const sent of sentences) {
-        if ((currentChunk + ' ' + sent).trim().length <= 1000) {
+        if ((currentChunk + ' ' + sent).trim().length <= maxSentChars) {
           currentChunk = (currentChunk + ' ' + sent).trim();
         } else {
           if (currentChunk) chunks.push(currentChunk);
-          if (sent.length > 1000) {
+          if (sent.length > maxSentChars) {
             const words = sent.split(/\s+/);
             let sub = '';
             for (const w of words) {
-              if ((sub + ' ' + w).trim().length <= 800) {
+              if ((sub + ' ' + w).trim().length <= maxWordChunkChars) {
                 sub = (sub + ' ' + w).trim();
               } else {
                 if (sub) chunks.push(sub);
@@ -755,6 +761,7 @@ app.post('/api/tts/edge', async (req, res) => {
               }
             }
             if (sub) chunks.push(sub);
+            currentChunk = '';
           } else {
             currentChunk = sent;
           }
@@ -769,38 +776,61 @@ app.post('/api/tts/edge', async (req, res) => {
     for (const chunk of chunks) {
       if (!chunk.trim()) continue;
 
-      if (voice === 'vi-VN-HoaiMyNeural') {
-        // Hoài My: Giọng Nữ miền Bắc chuẩn mực & truyền cảm
-        try {
-          const fb = await fetchGoogleTranslateAudio(chunk);
-          if (fb && fb.length > 0) {
-            audioBuffers.push(fb);
-            continue;
+      let edgeBuffer: Buffer | null = null;
+      let lastEdgeErr: unknown = null;
+      try {
+        edgeBuffer = await synthesizeEdgeDirect(chunk, voice, pitch, rate, volume);
+      } catch (err) {
+        lastEdgeErr = err;
+        if (isStrict) {
+          await new Promise((r) => setTimeout(r, 350));
+          try {
+            edgeBuffer = await synthesizeEdgeDirect(chunk, voice, pitch, rate, volume);
+          } catch (retryErr) {
+            lastEdgeErr = retryErr;
           }
-        } catch {}
+        }
+      }
+
+      if (edgeBuffer && edgeBuffer.length > 0) {
+        audioBuffers.push(edgeBuffer);
+        continue;
+      }
+
+      if (isStrict) {
+        const reason = lastEdgeErr instanceof Error ? lastEdgeErr.message : 'WebSocket error';
+        return res.status(502).json({
+          error: `Không thể kết nối giọng Microsoft Edge (${reason}). Đã dừng để tránh lẫn giọng khác.`,
+          success: false,
+        });
       }
 
       try {
-        const buf = await synthesizeEdgeDirect(chunk, voice, pitch, rate, volume);
-        if (buf && buf.length > 0) {
-          audioBuffers.push(buf);
+        const fb = await fetchGoogleTranslateAudio(chunk);
+        if (fb && fb.length > 0) {
+          audioBuffers.push(fb);
+          usedGoogleFallback = true;
         }
-      } catch {
-        try {
-          const fb = await fetchGoogleTranslateAudio(chunk);
-          if (fb && fb.length > 0) {
-            audioBuffers.push(fb);
-            usedGoogleFallback = true;
-          }
-        } catch {}
-      }
+      } catch {}
     }
 
     if (audioBuffers.length === 0) {
-      // Complete fallback
+      if (isStrict) {
+        return res.status(502).json({
+          error: 'Không nhận được dữ liệu âm thanh từ giọng Microsoft Edge đã chọn.',
+          success: false,
+        });
+      }
       const fb = await fetchGoogleTranslateAudio(cleanText);
       audioBuffers.push(fb);
       usedGoogleFallback = true;
+    }
+
+    if (isStrict && usedGoogleFallback) {
+      return res.status(502).json({
+        error: 'Phát hiện giọng dự phòng trong chế độ khóa cứng giọng Edge.',
+        success: false,
+      });
     }
 
     const fullAudioBuffer = Buffer.concat(audioBuffers);
@@ -825,6 +855,13 @@ app.post('/api/tts/edge', async (req, res) => {
 
     res.json(resultObj);
   } catch (error: any) {
+    if (req.body?.strict) {
+      return res.status(502).json({
+        error: error?.message || 'Không thể kết nối giọng Microsoft Edge trong chế độ khóa cứng giọng.',
+        success: false,
+      });
+    }
+
     try {
       const cleanText = (req.body?.text || '').trim();
       if (cleanText) {
@@ -843,6 +880,7 @@ app.post('/api/tts/edge', async (req, res) => {
     } catch {}
     res.status(500).json({
       error: error?.message || 'Lỗi tạo giọng đọc Microsoft Edge.',
+      success: false,
     });
   }
 });
@@ -850,37 +888,55 @@ app.post('/api/tts/edge', async (req, res) => {
 // 4. Google Translate TTS (Miễn phí 100% không cần thẻ / API Key)
 app.post('/api/tts/google-translate', async (req, res) => {
   try {
-    const { text, voice = 'google_translate_vi' } = req.body;
+    const { text, voice = 'google_translate_vi', strict = false } = req.body;
     if (!text || typeof text !== 'string') {
-      return res.status(400).json({ error: 'Nội dung đọc không được để trống.' });
+      return res.status(400).json({ error: 'Nội dung đọc không được để trống.', success: false });
     }
 
-    const cacheKey = `gt_${voice}_${text.trim()}`;
+    const isStrict = Boolean(strict);
+    const cacheKey = `gt_${isStrict ? 'strict_' : ''}${voice}_${text.trim()}`;
     if (ttsAudioCache.has(cacheKey)) {
       return res.json(ttsAudioCache.get(cacheKey));
     }
 
     let fullAudioBuffer: Buffer;
     if (voice === 'google_translate_vi_south_male' || voice.includes('south_male')) {
-      // Authentic Vietnamese Male Voice for Southern Male option
-      try {
+      if (isStrict) {
         fullAudioBuffer = await synthesizeEdgeDirect(text, 'vi-VN-NamMinhNeural', 1.0, 0.96, 1.0);
-      } catch {
-        fullAudioBuffer = await fetchGoogleTranslateAudio(text);
+      } else {
+        try {
+          fullAudioBuffer = await synthesizeEdgeDirect(text, 'vi-VN-NamMinhNeural', 1.0, 0.96, 1.0);
+        } catch {
+          fullAudioBuffer = await fetchGoogleTranslateAudio(text);
+        }
       }
     } else if (voice === 'google_translate_vi_south_female' || voice.includes('south_female')) {
-      // Authentic Vietnamese Female Voice for Southern Female option (Google Dịch Nữ Miền Nam)
-      try {
+      if (isStrict) {
         fullAudioBuffer = await synthesizeEdgeDirect(text, 'vi-VN-MaiLinh-Southern', 1.0, 1.0, 1.0);
-      } catch {
-        fullAudioBuffer = await fetchGoogleTranslateAudio(text);
+      } else {
+        try {
+          fullAudioBuffer = await synthesizeEdgeDirect(text, 'vi-VN-MaiLinh-Southern', 1.0, 1.0, 1.0);
+        } catch {
+          fullAudioBuffer = await fetchGoogleTranslateAudio(text);
+        }
       }
     } else {
-      // Pristine Google Translate Vietnamese Female Voice (Northern)
-      try {
-        fullAudioBuffer = await fetchGoogleTranslateAudio(text);
-      } catch {
-        fullAudioBuffer = await synthesizeEdgeDirect(text, 'vi-VN-HoaiMyNeural', 1.0, 1.0, 1.0);
+      if (isStrict) {
+        try {
+          fullAudioBuffer = await fetchGoogleTranslateAudio(text);
+        } catch {
+          await new Promise((r) => setTimeout(r, 300));
+          fullAudioBuffer = await fetchGoogleTranslateAudio(text);
+        }
+        if (!fullAudioBuffer || fullAudioBuffer.length === 0) {
+          throw new Error('Không nhận được dữ liệu âm thanh từ Google Dịch TTS.');
+        }
+      } else {
+        try {
+          fullAudioBuffer = await fetchGoogleTranslateAudio(text);
+        } catch {
+          fullAudioBuffer = await synthesizeEdgeDirect(text, 'vi-VN-HoaiMyNeural', 1.0, 1.0, 1.0);
+        }
       }
     }
 
@@ -891,6 +947,7 @@ app.post('/api/tts/google-translate', async (req, res) => {
       mimeType: 'audio/mp3',
       sampleRate: 24000,
       voice: voice,
+      isFallback: false,
       success: true,
     };
 
@@ -902,6 +959,13 @@ app.post('/api/tts/google-translate', async (req, res) => {
 
     res.json(resultObj);
   } catch (error: any) {
+    if (req.body?.strict) {
+      return res.status(502).json({
+        error: error?.message || 'Không thể kết nối giọng Google Dịch TTS trong chế độ khóa cứng giọng.',
+        success: false,
+      });
+    }
+
     try {
       const cleanText = (req.body?.text || '').trim();
       if (cleanText) {
@@ -922,6 +986,7 @@ app.post('/api/tts/google-translate', async (req, res) => {
     } catch {}
     res.status(500).json({
       error: error?.message || 'Lỗi tạo giọng đọc Google Translate TTS.',
+      success: false,
     });
   }
 });

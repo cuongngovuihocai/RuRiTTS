@@ -1100,6 +1100,7 @@ export default function App() {
           isOpen={isExporterOpen}
           onClose={() => setIsExporterOpen(false)}
           book={activeBook}
+          voices={voices}
           voiceSettings={voiceSettings}
           isOffline={isOffline}
           theme={theme}

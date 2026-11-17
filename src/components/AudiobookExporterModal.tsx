@@ -4,15 +4,15 @@ import {
   X,
   FolderDown,
   FileAudio,
-  CheckCircle2,
   AlertCircle,
   Loader2,
   Download,
   FileArchive,
   Music,
   Zap,
+  Lock,
 } from 'lucide-react';
-import { Book, VoiceSettings } from '../types';
+import { Book, VietnameseVoice, VoiceSettings, ThemeMode } from '../types';
 import {
   concatAudioBuffersToWavBlob,
   concatMp3Base64Chunks,
@@ -26,19 +26,19 @@ import {
   generateGoogleTranslateSpeech,
   hasBackendSupport,
 } from '../services/geminiService';
-import { ThemeMode } from '../types';
 import { getThemeConfig } from '../utils/themeStyles';
 
 interface AudiobookExporterModalProps {
   isOpen: boolean;
   onClose: () => void;
   book: Book;
+  voices?: VietnameseVoice[];
   voiceSettings: VoiceSettings;
   isOffline: boolean;
   theme?: ThemeMode;
 }
 
-function splitTextForTtsExport(rawText: string, maxChars = 850): string[] {
+function splitTextForTtsExport(rawText: string, maxChars = 450): string[] {
   const clean = rawText.trim();
   if (!clean) return [];
   if (clean.length <= maxChars) return [clean];
@@ -104,13 +104,29 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
   isOpen,
   onClose,
   book,
+  voices,
   voiceSettings,
   isOffline,
-  theme = 'elegant-dark',
+  theme = 'dark-stone',
 }) => {
   const themeConfig = getThemeConfig(theme as ThemeMode);
   const isMultiChapter = book.chapters.length > 1;
   const backendReady = hasBackendSupport();
+  const isNativeVoiceSelected = voiceSettings.engine === 'native';
+
+  const selectedVoice = voices?.find((v) => v.id === voiceSettings.voiceId);
+  const selectedVoiceName =
+    selectedVoice?.name ||
+    (voiceSettings.engine === 'google-translate'
+      ? 'Google Dịch Nữ'
+      : voiceSettings.voiceId || 'Giọng đã chọn');
+  const selectedEngineLabel =
+    voiceSettings.engine === 'edge'
+      ? 'Microsoft Edge'
+      : voiceSettings.engine === 'google-translate'
+      ? 'Google TTS'
+      : 'Giọng thiết bị (Offline)';
+
   const [exportScope, setExportScope] = useState<'single_full' | 'current' | 'zip_chapters'>(
     isMultiChapter ? 'single_full' : 'current'
   );
@@ -129,92 +145,143 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
 
   const currentChapter = book.chapters[book.currentChapterIndex] || book.chapters[0];
 
-  const synthesizeChunkWithRetry = async (
+  const synthesizeChunkStrict = async (
     chunkText: string,
     effectiveRate: number,
     effectivePitch: number,
     effectiveVolume: number
   ): Promise<string> => {
-    const preferEdge = voiceSettings.engine === 'edge';
-    for (let attempt = 0; attempt < 2; attempt++) {
-      if (preferEdge) {
+    if (voiceSettings.engine === 'native') {
+      throw new Error(
+        'Giọng đọc thiết bị (Offline) không hỗ trợ xuất ra file MP3/WAV. Vui lòng mở "Giọng đọc & Giao diện" và chọn một giọng Microsoft Edge hoặc Google TTS.'
+      );
+    }
+
+    if (voiceSettings.engine === 'edge') {
+      const retryDelays = [600, 1200, 2200, 3200];
+      let lastError: any = null;
+
+      for (let attempt = 0; attempt < 4; attempt++) {
         try {
           const res = await generateEdgeSpeech(
             chunkText,
             voiceSettings.voiceId,
             effectiveRate,
             effectivePitch,
-            effectiveVolume
+            effectiveVolume,
+            { strict: true }
           );
-          if (res?.audioBase64) return res.audioBase64;
-        } catch (err) {
-          if (attempt === 1) {
-            console.warn('Edge chunk export failed after retry, falling back to Google Translate TTS:', err);
+          if (res?.audioBase64 && !res.isFallback) {
+            return res.audioBase64;
+          }
+          throw new Error('Phản hồi không hợp lệ hoặc bị chuyển sang giọng dự phòng.');
+        } catch (err: any) {
+          lastError = err;
+          if (attempt < 3) {
+            await new Promise((r) => setTimeout(r, retryDelays[attempt]));
           }
         }
       }
 
-      try {
-        const res = await generateGoogleTranslateSpeech(chunkText, voiceSettings.voiceId);
-        if (res?.audioBase64) return res.audioBase64;
-      } catch (gtErr) {
-        if (attempt === 1) {
-          throw gtErr;
-        }
-      }
-
-      await new Promise((r) => setTimeout(r, 400));
+      throw new Error(
+        `Không thể kết nối giọng Microsoft Edge "${selectedVoiceName}" sau 4 lần thử (${lastError?.message || 'Lỗi mạng'}). Đã dừng để đảm bảo file Audiobook không bị lẫn giọng khác.`
+      );
     }
 
-    throw new Error('Không thể tổng hợp đoạn âm thanh từ máy chủ.');
+    // Strict Google Translate TTS
+    const gtDelays = [500, 1100, 1800];
+    let lastGtError: any = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const res = await generateGoogleTranslateSpeech(chunkText, voiceSettings.voiceId, { strict: true });
+        if (res?.audioBase64 && !res.isFallback) {
+          return res.audioBase64;
+        }
+        throw new Error('Phản hồi Google TTS không hợp lệ.');
+      } catch (err: any) {
+        lastGtError = err;
+        if (attempt < 2) {
+          await new Promise((r) => setTimeout(r, gtDelays[attempt]));
+        }
+      }
+    }
+
+    throw new Error(
+      `Không thể kết nối giọng Google TTS "${selectedVoiceName}" sau 3 lần thử (${lastGtError?.message || 'Lỗi mạng'}). Đã dừng để đảm bảo file Audiobook không bị lẫn giọng khác.`
+    );
   };
 
-  // Synthesize text to MP3 or WAV Blob in Vercel-safe chunks (< 850 chars per API call)
+  const buildAudioBlobFromBase64Chunks = async (
+    base64Chunks: string[],
+    format: 'mp3' | 'wav'
+  ): Promise<Blob> => {
+    if (format === 'mp3') {
+      return concatMp3Base64Chunks(base64Chunks);
+    }
+    const buffers: AudioBuffer[] = [];
+    for (const b64 of base64Chunks) {
+      buffers.push(await decodeAudioBase64(b64));
+    }
+    return concatAudioBuffersToWavBlob(buffers);
+  };
+
+  // Synthesize text to MP3 or WAV Blob in small sequential chunks (<= 450 chars) locked strictly to 1 voice
   const synthesizeTextToAudio = async (
     text: string,
     format: 'mp3' | 'wav',
-    onChunkProgress?: (done: number, total: number) => void
+    onChunkProgress?: (done: number, total: number) => void,
+    partialTracker?: { chunks: string[]; total: number }
   ): Promise<Blob> => {
     const emotionAcoustics = getEmotionAcoustics(voiceSettings.emotion);
     const effectiveRate = Math.max(0.5, Math.min(3.0, voiceSettings.rate * emotionAcoustics.rateMultiplier));
     const effectivePitch = Math.max(0.5, Math.min(1.5, voiceSettings.pitch * emotionAcoustics.pitchMultiplier));
     const effectiveVolume = Math.max(0, Math.min(1.0, voiceSettings.volume * emotionAcoustics.volumeMultiplier));
 
+    if (voiceSettings.engine === 'native') {
+      throw new Error(
+        'Giọng đọc thiết bị (Offline) không hỗ trợ xuất thành file Audio. Hãy chuyển sang giọng Microsoft Edge hoặc Google TTS trong "Giọng đọc & Giao diện".'
+      );
+    }
+
     if (!backendReady) {
-      throw new Error('Chưa kết nối máy chủ Backend (Vercel). Vui lòng mở "Giọng đọc & Giao diện" để dán link Vercel Backend trước khi xuất file âm thanh.');
+      throw new Error('Không thể kết nối máy chủ xử lý giọng đọc trực tuyến.');
     }
 
     if (isOffline) {
       throw new Error('Thiết bị đang ngoại tuyến (Offline). Vui lòng kết nối Internet để xuất file Audio MP3/WAV.');
     }
 
-    const chunks = splitTextForTtsExport(text, 850);
+    const chunks = splitTextForTtsExport(text, 450);
     if (chunks.length === 0) {
       throw new Error('Nội dung văn bản trống, không thể tạo file âm thanh.');
     }
 
+    if (partialTracker) {
+      partialTracker.total = chunks.length;
+    }
+
     const base64Chunks: string[] = [];
+    const interChunkPauseMs = voiceSettings.engine === 'edge' ? 150 : 30;
+
     for (let i = 0; i < chunks.length; i++) {
       onChunkProgress?.(i, chunks.length);
-      const b64 = await synthesizeChunkWithRetry(
+      const b64 = await synthesizeChunkStrict(
         chunks[i],
         effectiveRate,
         effectivePitch,
         effectiveVolume
       );
       base64Chunks.push(b64);
+      partialTracker?.chunks.push(b64);
       onChunkProgress?.(i + 1, chunks.length);
+
+      // Gentle throttle pause between chunks so Bing Edge WebSocket doesn't rate-limit long exports
+      if (i < chunks.length - 1 && interChunkPauseMs > 0) {
+        await new Promise((r) => setTimeout(r, interChunkPauseMs));
+      }
     }
 
-    if (format === 'mp3') {
-      return concatMp3Base64Chunks(base64Chunks);
-    } else {
-      const buffers: AudioBuffer[] = [];
-      for (const b64 of base64Chunks) {
-        buffers.push(await decodeAudioBase64(b64));
-      }
-      return concatAudioBuffersToWavBlob(buffers);
-    }
+    return buildAudioBlobFromBase64Chunks(base64Chunks, format);
   };
 
   const sanitizeFileName = (name: string) => {
@@ -231,6 +298,12 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
   };
 
   const handleStartExport = async () => {
+    if (progress.downloadUrl) {
+      try {
+        URL.revokeObjectURL(progress.downloadUrl);
+      } catch {}
+    }
+
     setIsExporting(true);
     if (voiceSettings.enableSoundCues) playSoundCue('click');
 
@@ -246,22 +319,32 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
       fileName: '',
     });
 
+    // Trackers for partial valid audio recovery if connection drops mid-export
+    const singlePartialTracker = { chunks: [] as string[], total: 0 };
+    const completedZipTracks: { index: number; title: string; trackName: string; blob: Blob }[] = [];
+    const failedChapterPartials: { index: number; title: string; tracker: { chunks: string[]; total: number } }[] = [];
+
     try {
       if (exportScope === 'single_full') {
         const fullText = book.chapters
           .map((c) => c.sentences.map((s) => s.text).join(' '))
           .join('\n\n');
 
-        const audioBlob = await synthesizeTextToAudio(fullText, exportFormat, (done, total) => {
-          setProgress({
-            status: 'generating',
-            currentChapter: done,
-            totalChapters: total,
-            message: `Đang kết xuất đoạn ${done}/${total} thành file .${fileExt.toUpperCase()}...`,
-            downloadUrl: '',
-            fileName: '',
-          });
-        });
+        const audioBlob = await synthesizeTextToAudio(
+          fullText,
+          exportFormat,
+          (done, total) => {
+            setProgress({
+              status: 'generating',
+              currentChapter: done,
+              totalChapters: total,
+              message: `Đang kết xuất đoạn ${done}/${total} thành file .${fileExt.toUpperCase()}...`,
+              downloadUrl: '',
+              fileName: '',
+            });
+          },
+          singlePartialTracker
+        );
 
         const url = URL.createObjectURL(audioBlob);
         const fileName = `${safeTitle}.${fileExt}`;
@@ -282,16 +365,21 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
         const safeChapterTitle = sanitizeFileName(chapter.title);
         const textContent = chapter.sentences.map((s) => s.text).join(' ');
 
-        const audioBlob = await synthesizeTextToAudio(textContent, exportFormat, (done, total) => {
-          setProgress({
-            status: 'generating',
-            currentChapter: done,
-            totalChapters: total,
-            message: `Đang tạo đoạn ${done}/${total} chương "${chapter.title}"...`,
-            downloadUrl: '',
-            fileName: '',
-          });
-        });
+        const audioBlob = await synthesizeTextToAudio(
+          textContent,
+          exportFormat,
+          (done, total) => {
+            setProgress({
+              status: 'generating',
+              currentChapter: done,
+              totalChapters: total,
+              message: `Đang tạo đoạn ${done}/${total} chương "${chapter.title}"...`,
+              downloadUrl: '',
+              fileName: '',
+            });
+          },
+          singlePartialTracker
+        );
 
         const url = URL.createObjectURL(audioBlob);
         const fileName = `${safeTitle}_${safeChapterTitle}.${fileExt}`;
@@ -308,36 +396,113 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
         triggerAutoDownload(url, fileName);
         if (voiceSettings.enableSoundCues) playSoundCue('success');
       } else {
-        // 3. Export separate chapter audio files in a clean ZIP package (NO redundant text files)
+        // 3. Export separate chapter audio files in a clean ZIP package:
+        // - Google TTS: parallel batching (3 chapters/batch) for fast speed
+        // - Microsoft Edge TTS: sequential chapter processing to prevent Bing WebSocket throttling
         const chapters = book.chapters;
         const total = chapters.length;
         const zip = new JSZip();
 
-        // Process chapters concurrently in batches of 3 for fast generation
-        const BATCH_SIZE = 3;
-        let completedCount = 0;
+        if (voiceSettings.engine === 'google-translate') {
+          const BATCH_SIZE = 3;
+          let completedCount = 0;
 
-        for (let i = 0; i < total; i += BATCH_SIZE) {
-          const batch = chapters.slice(i, i + BATCH_SIZE);
-          await Promise.all(
-            batch.map(async (chap, batchIdx) => {
-              const actualIdx = i + batchIdx;
-              const textContent = chap.sentences.map((s) => s.text).join(' ');
-              const audioBlob = await synthesizeTextToAudio(textContent, exportFormat);
+          for (let i = 0; i < total; i += BATCH_SIZE) {
+            const batch = chapters.slice(i, i + BATCH_SIZE);
+            const batchResults = await Promise.allSettled(
+              batch.map(async (chap, batchIdx) => {
+                const actualIdx = i + batchIdx;
+                const tracker = { chunks: [] as string[], total: 0 };
+                const textContent = chap.sentences.map((s) => s.text).join(' ');
+                try {
+                  const audioBlob = await synthesizeTextToAudio(textContent, exportFormat, undefined, tracker);
+                  const paddedIndex = String(actualIdx + 1).padStart(2, '0');
+                  const trackName = `${paddedIndex}_${sanitizeFileName(chap.title)}.${fileExt}`;
+                  completedZipTracks.push({ index: actualIdx, title: chap.title, trackName, blob: audioBlob });
 
-              const paddedIndex = String(actualIdx + 1).padStart(2, '0');
+                  completedCount++;
+                  setProgress({
+                    status: 'generating',
+                    currentChapter: completedCount,
+                    totalChapters: total,
+                    message: `Đang xử lý song song: đã xong ${completedCount}/${total} chương...`,
+                    downloadUrl: '',
+                    fileName: '',
+                  });
+                } catch (chapErr) {
+                  if (tracker.chunks.length > 0) {
+                    failedChapterPartials.push({ index: actualIdx, title: chap.title, tracker });
+                  }
+                  throw chapErr;
+                }
+              })
+            );
+
+            const rejected = batchResults.find((r) => r.status === 'rejected') as PromiseRejectedResult | undefined;
+            if (rejected) {
+              throw rejected.reason;
+            }
+          }
+        } else {
+          for (let i = 0; i < total; i++) {
+            const chap = chapters[i];
+            const tracker = { chunks: [] as string[], total: 0 };
+            const textContent = chap.sentences.map((s) => s.text).join(' ');
+
+            setProgress({
+              status: 'generating',
+              currentChapter: i,
+              totalChapters: total,
+              message: `Đang xử lý chương ${i + 1}/${total}: "${chap.title}"...`,
+              downloadUrl: '',
+              fileName: '',
+            });
+
+            try {
+              const audioBlob = await synthesizeTextToAudio(
+                textContent,
+                exportFormat,
+                (done, chunkTotal) => {
+                  setProgress({
+                    status: 'generating',
+                    currentChapter: i,
+                    totalChapters: total,
+                    message: `Chương ${i + 1}/${total} ("${chap.title}"): đoạn ${done}/${chunkTotal}...`,
+                    downloadUrl: '',
+                    fileName: '',
+                  });
+                },
+                tracker
+              );
+
+              const paddedIndex = String(i + 1).padStart(2, '0');
               const trackName = `${paddedIndex}_${sanitizeFileName(chap.title)}.${fileExt}`;
-              zip.file(trackName, audioBlob);
+              completedZipTracks.push({ index: i, title: chap.title, trackName, blob: audioBlob });
 
-              completedCount++;
-              setProgress((prev) => ({
-                ...prev,
-                currentChapter: completedCount,
+              setProgress({
+                status: 'generating',
+                currentChapter: i + 1,
                 totalChapters: total,
-                message: `Đang xử lý ${completedCount}/${total} chương: "${chap.title}"...`,
-              }));
-            })
-          );
+                message: `Đã xong ${i + 1}/${total} chương: "${chap.title}"`,
+                downloadUrl: '',
+                fileName: '',
+              });
+
+              if (i < total - 1) {
+                await new Promise((r) => setTimeout(r, 200));
+              }
+            } catch (chapErr) {
+              if (tracker.chunks.length > 0) {
+                failedChapterPartials.push({ index: i, title: chap.title, tracker });
+              }
+              throw chapErr;
+            }
+          }
+        }
+
+        completedZipTracks.sort((a, b) => a.index - b.index);
+        for (const track of completedZipTracks) {
+          zip.file(track.trackName, track.blob);
         }
 
         // Add lightweight JSON metadata (NO heavy/redundant txt transcript)
@@ -348,12 +513,14 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
           totalWords: book.wordCount,
           audioFormat: fileExt.toUpperCase(),
           voiceEngine: voiceSettings.engine,
-          voiceName: voiceSettings.voiceName,
+          voiceId: voiceSettings.voiceId,
+          voiceName: selectedVoiceName,
+          strictSingleVoice: true,
           exportedAt: new Date().toISOString(),
-          chapters: chapters.map((c, idx) => ({
-            track: idx + 1,
-            fileName: `${String(idx + 1).padStart(2, '0')}_${sanitizeFileName(c.title)}.${fileExt}`,
-            title: c.title,
+          chapters: completedZipTracks.map((t) => ({
+            track: t.index + 1,
+            fileName: t.trackName,
+            title: t.title,
           })),
         };
         zip.file('thong_tin_audio.json', JSON.stringify(metadata, null, 2));
@@ -390,13 +557,56 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
       }
     } catch (err: any) {
       console.error('Export error:', err);
+      let partialUrl = '';
+      let partialFileName = '';
+      let partialNote = '';
+
+      try {
+        if (exportScope === 'zip_chapters' && (completedZipTracks.length > 0 || failedChapterPartials.length > 0)) {
+          const partialZip = new JSZip();
+          completedZipTracks.sort((a, b) => a.index - b.index);
+          for (const track of completedZipTracks) {
+            partialZip.file(track.trackName, track.blob);
+          }
+
+          let partialChapterCount = 0;
+          for (const fp of failedChapterPartials) {
+            if (fp.tracker.chunks.length > 0) {
+              const partialBlob = await buildAudioBlobFromBase64Chunks(fp.tracker.chunks, exportFormat);
+              const paddedIndex = String(fp.index + 1).padStart(2, '0');
+              const trackName = `${paddedIndex}_${sanitizeFileName(fp.title)}_(DANG_DO_${fp.tracker.chunks.length}tren${fp.tracker.total}).${fileExt}`;
+              partialZip.file(trackName, partialBlob);
+              partialChapterCount++;
+            }
+          }
+
+          const partialZipBlob = await partialZip.generateAsync({ type: 'blob', compression: 'STORE' });
+          partialUrl = URL.createObjectURL(partialZipBlob);
+          partialFileName = `${safeTitle}_Audio_(DANG_DO_${completedZipTracks.length}tren${book.chapters.length}_chuong)_${fileExt.toUpperCase()}.zip`;
+          partialNote = ` Đã lưu sẵn ${completedZipTracks.length}/${book.chapters.length} chương hoàn chỉnh${
+            partialChapterCount > 0 ? ` và ${partialChapterCount} file đang đọc dở (được gắn nhãn "(DANG_DO_...)" trong tên file)` : ''
+          } để bạn tải về bên dưới.`;
+        } else if (exportScope !== 'zip_chapters' && singlePartialTracker.chunks.length > 0) {
+          const partialBlob = await buildAudioBlobFromBase64Chunks(singlePartialTracker.chunks, exportFormat);
+          partialUrl = URL.createObjectURL(partialBlob);
+          const baseName =
+            exportScope === 'current'
+              ? `${safeTitle}_${sanitizeFileName(currentChapter.title)}`
+              : safeTitle;
+          partialFileName = `${baseName}_(DANG_DO_${singlePartialTracker.chunks.length}tren${singlePartialTracker.total}).${fileExt}`;
+          partialNote = ` Đã giữ lại phần âm thanh hợp lệ từ đầu đến đoạn ${singlePartialTracker.chunks.length}/${singlePartialTracker.total} (nghe bình thường, đúng 1 giọng) ở nút tải bên dưới.`;
+        }
+      } catch (partialErr) {
+        console.warn('Could not package partial audio:', partialErr);
+      }
+
       setProgress({
         status: 'error',
         currentChapter: 0,
         totalChapters: 0,
-        message: err?.message || 'Có lỗi xảy ra trong quá trình tạo file âm thanh.',
-        downloadUrl: '',
-        fileName: '',
+        message: (err?.message || 'Có lỗi xảy ra trong quá trình tạo file âm thanh.') + partialNote,
+        downloadUrl: partialUrl,
+        fileName: partialFileName,
       });
       if (voiceSettings.enableSoundCues) playSoundCue('error');
     } finally {
@@ -564,16 +774,42 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
             </div>
           </div>
 
+          {/* Native Voice Guard Notice */}
+          {isNativeVoiceSelected && (
+            <div className="p-3.5 rounded-2xl border border-amber-500/40 bg-amber-500/10 text-amber-200 text-xs flex items-start gap-2.5">
+              <AlertCircle className="w-4 h-4 text-amber-400 flex-shrink-0 mt-0.5" />
+              <div className="space-y-1">
+                <p className="font-bold text-amber-300">
+                  Giọng đọc thiết bị (Offline) chỉ nghe trực tiếp, không thể xuất thành file Audio.
+                </p>
+                <p className="opacity-90">
+                  Vui lòng mở <strong>Giọng đọc &amp; Giao diện</strong> và chọn một giọng <strong>Microsoft Edge</strong> hoặc <strong>Google TTS</strong> để tạo file Audiobook đồng nhất 100%.
+                </p>
+              </div>
+            </div>
+          )}
+
           {/* Summary Info */}
           <div className={`p-3.5 rounded-2xl ${themeConfig.cardInner} border ${themeConfig.border} space-y-1.5 text-xs ${themeConfig.textPrimary}`}>
             <div className="flex justify-between">
               <span className={`font-bold ${themeConfig.textSecondary}`}>Nội dung:</span>
               <span className="font-black truncate max-w-[280px]" style={{ color: themeConfig.hex.accent }}>{book.title}</span>
             </div>
-            <div className="flex justify-between">
+            <div className="flex justify-between items-center gap-2">
               <span className={`font-bold ${themeConfig.textSecondary}`}>Giọng đọc:</span>
-              <span>{voiceSettings.voiceName} ({voiceSettings.rate}x)</span>
+              <span className="font-semibold text-right">
+                {selectedVoiceName} · {selectedEngineLabel} ({voiceSettings.rate}x)
+              </span>
             </div>
+            {!isNativeVoiceSelected && (
+              <div className="flex justify-between items-center gap-2">
+                <span className={`font-bold ${themeConfig.textSecondary}`}>Chế độ giọng:</span>
+                <span className="inline-flex items-center gap-1 text-emerald-400 font-bold">
+                  <Lock className="w-3 h-3" />
+                  Khóa cứng 100% đúng giọng đã chọn
+                </span>
+              </div>
+            )}
             <div className="flex justify-between">
               <span className={`font-bold ${themeConfig.textSecondary}`}>Kết quả xuất:</span>
               <span className="text-emerald-400 font-bold">
@@ -589,17 +825,19 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
           {/* Progress / Status Display */}
           {progress.status !== 'idle' && (
             <div className={`space-y-3 p-4 rounded-2xl ${themeConfig.cardInner} border ${themeConfig.border} animate-in fade-in`}>
-              <div className="flex items-center justify-between text-xs font-bold">
-                <span className="flex items-center gap-2" style={{ color: themeConfig.hex.accent }}>
-                  {isExporting && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
-                  <span>{progress.message}</span>
-                </span>
-                {progress.totalChapters > 1 && (
-                  <span className={themeConfig.textPrimary}>
-                    {progress.currentChapter}/{progress.totalChapters}
+              {progress.status !== 'error' && (
+                <div className="flex items-center justify-between text-xs font-bold">
+                  <span className="flex items-center gap-2" style={{ color: themeConfig.hex.accent }}>
+                    {isExporting && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                    <span>{progress.message}</span>
                   </span>
-                )}
-              </div>
+                  {progress.totalChapters > 1 && (
+                    <span className={themeConfig.textPrimary}>
+                      {progress.currentChapter}/{progress.totalChapters}
+                    </span>
+                  )}
+                </div>
+              )}
 
               {isExporting && (
                 <div className={`w-full h-2 rounded-full ${themeConfig.card} overflow-hidden border ${themeConfig.border}`}>
@@ -632,9 +870,22 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
               )}
 
               {progress.status === 'error' && (
-                <div className="flex items-center gap-2 text-red-400 text-xs font-bold">
-                  <AlertCircle className="w-4 h-4 flex-shrink-0" />
-                  <span>{progress.message}</span>
+                <div className="space-y-3">
+                  <div className="flex items-start gap-2 text-red-400 text-xs font-bold">
+                    <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+                    <span>{progress.message}</span>
+                  </div>
+
+                  {progress.downloadUrl && progress.fileName && (
+                    <a
+                      href={progress.downloadUrl}
+                      download={progress.fileName}
+                      className="w-full flex items-center justify-center gap-2 py-3 px-4 rounded-xl bg-amber-500 hover:bg-amber-400 text-stone-950 font-black text-xs sm:text-sm shadow-lg shadow-amber-500/20 active:scale-95 transition-all"
+                    >
+                      <Download className="w-4 h-4 stroke-[2.5]" />
+                      <span className="truncate">Tải phần âm thanh đã hoàn thành ({progress.fileName})</span>
+                    </a>
+                  )}
                 </div>
               )}
             </div>
@@ -654,8 +905,8 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
           <button
             type="button"
             onClick={handleStartExport}
-            disabled={isExporting}
-            className={`flex items-center gap-2 px-6 py-2.5 rounded-xl text-xs sm:text-sm font-black ${themeConfig.accent} ${themeConfig.accentHover} ${themeConfig.accentText} shadow-md transition-all active:scale-95 disabled:opacity-50`}
+            disabled={isExporting || isNativeVoiceSelected}
+            className={`flex items-center gap-2 px-6 py-2.5 rounded-xl text-xs sm:text-sm font-black ${themeConfig.accent} ${themeConfig.accentHover} ${themeConfig.accentText} shadow-md transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed`}
           >
             {isExporting ? (
               <>
