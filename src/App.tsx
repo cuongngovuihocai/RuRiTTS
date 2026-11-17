@@ -56,6 +56,7 @@ import { AudiobookExporterModal } from './components/AudiobookExporterModal';
 import { LibraryModal } from './components/LibraryModal';
 import { DictionaryModal } from './components/DictionaryModal';
 import { ShortcutsHelpModal } from './components/ShortcutsHelpModal';
+import { TextEditorModal } from './components/TextEditorModal';
 import { getThemeConfig } from './utils/themeStyles';
 
 const DEFAULT_SETTINGS: VoiceSettings = {
@@ -99,6 +100,15 @@ export default function App() {
   const [isLibraryOpen, setIsLibraryOpen] = useState(false);
   const [isDictionaryOpen, setIsDictionaryOpen] = useState(false);
   const [isShortcutsOpen, setIsShortcutsOpen] = useState(false);
+  const [textEditorState, setTextEditorState] = useState<{
+    isOpen: boolean;
+    tab: 'sentence' | 'chapter';
+    sentenceIndex: number;
+  }>({
+    isOpen: false,
+    tab: 'sentence',
+    sentenceIndex: 0,
+  });
 
   // Audio Playback References
   const currentUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
@@ -837,6 +847,288 @@ export default function App() {
     }
   };
 
+  // 5b. Manual Spelling & Content Editing (Current/Upcoming Sentence, Chapter, or Bulk Replace)
+  const handleOpenTextEditor = useCallback(
+    (tab: 'sentence' | 'chapter' = 'sentence', sentenceIndex?: number) => {
+      if (!activeBook) return;
+      if (playbackState === 'playing' || playbackState === 'synthesizing') {
+        stopAudioPlayback();
+      }
+      setTextEditorState({
+        isOpen: true,
+        tab,
+        sentenceIndex: sentenceIndex ?? currentSentenceIndex,
+      });
+    },
+    [activeBook, playbackState, stopAudioPlayback, currentSentenceIndex]
+  );
+
+  const persistEditedBook = useCallback(async (updatedBook: Book) => {
+    setActiveBook(updatedBook);
+    await saveBook(updatedBook);
+    const updatedList = await getAllBooks();
+    setSavedBooks(updatedList);
+  }, []);
+
+  const handleSaveSentenceEdit = useCallback(
+    async (
+      chapIdx: number,
+      sentIdx: number,
+      newText: string,
+      playAfterSave = false
+    ) => {
+      if (!activeBook) return;
+      stopAudioPlayback();
+      audioBufferCacheRef.current.clear();
+
+      const targetChap = activeBook.chapters[chapIdx];
+      if (!targetChap) return;
+
+      const oldSentences = targetChap.sentences;
+      const oldSent = oldSentences[sentIdx];
+      if (!oldSent) return;
+
+      const trimmedNew = newText.trim();
+      let updatedSentences = [...oldSentences];
+      let updatedBookmarks = [...activeBook.bookmarks];
+      let updatedContent = targetChap.content || oldSentences.map((s) => s.text).join('\n\n');
+
+      // Locate exact position of this sentence in chapter.content to preserve paragraphs
+      let searchFrom = 0;
+      for (let k = 0; k < sentIdx; k++) {
+        const prevPos = updatedContent.indexOf(oldSentences[k].text, searchFrom);
+        if (prevPos !== -1) searchFrom = prevPos + oldSentences[k].text.length;
+      }
+      const targetPos = updatedContent.indexOf(oldSent.text, searchFrom);
+
+      let nextSentenceIdx = sentIdx;
+
+      if (!trimmedNew) {
+        // Delete empty/junk sentence
+        if (updatedSentences.length > 1) {
+          updatedSentences.splice(sentIdx, 1);
+          updatedSentences = updatedSentences.map((s, idx) => ({
+            ...s,
+            index: idx,
+          }));
+
+          updatedBookmarks = updatedBookmarks
+            .filter((b) => !(b.chapterIndex === chapIdx && b.sentenceIndex === sentIdx))
+            .map((b) =>
+              b.chapterIndex === chapIdx && b.sentenceIndex > sentIdx
+                ? { ...b, sentenceIndex: b.sentenceIndex - 1 }
+                : b
+            );
+
+          if (targetPos !== -1) {
+            updatedContent =
+              (
+                updatedContent.slice(0, targetPos) +
+                updatedContent.slice(targetPos + oldSent.text.length)
+              )
+                .replace(/\n{3,}/g, '\n\n')
+                .trim();
+          } else {
+            updatedContent = updatedSentences.map((s) => s.text).join('\n\n');
+          }
+
+          nextSentenceIdx = Math.min(sentIdx, updatedSentences.length - 1);
+        }
+      } else {
+        updatedSentences[sentIdx] = {
+          ...oldSent,
+          text: trimmedNew,
+          cleanText: trimmedNew,
+        };
+
+        updatedBookmarks = updatedBookmarks.map((b) =>
+          b.chapterIndex === chapIdx && b.sentenceIndex === sentIdx
+            ? { ...b, sentenceText: trimmedNew }
+            : b
+        );
+
+        if (targetPos !== -1) {
+          updatedContent =
+            updatedContent.slice(0, targetPos) +
+            trimmedNew +
+            updatedContent.slice(targetPos + oldSent.text.length);
+        } else {
+          updatedContent = updatedSentences.map((s) => s.text).join('\n\n');
+        }
+      }
+
+      const updatedChapters = [...activeBook.chapters];
+      updatedChapters[chapIdx] = {
+        ...targetChap,
+        content: updatedContent,
+        sentences: updatedSentences,
+      };
+
+      const cleanedFullText = updatedChapters.map((c) => c.content).join('\n\n');
+      const totalWords = cleanedFullText.trim()
+        ? cleanedFullText.trim().split(/\s+/).length
+        : 0;
+
+      const updatedBook: Book = {
+        ...activeBook,
+        chapters: updatedChapters,
+        cleanedText: cleanedFullText,
+        wordCount: totalWords,
+        currentSentenceIndex:
+          chapIdx === currentChapterIndex ? nextSentenceIdx : activeBook.currentSentenceIndex,
+        bookmarks: updatedBookmarks,
+        updatedAt: Date.now(),
+      };
+
+      if (chapIdx === currentChapterIndex) {
+        setCurrentSentenceIndex(nextSentenceIdx);
+      }
+
+      await persistEditedBook(updatedBook);
+
+      if (playAfterSave && updatedChapters[chapIdx]?.sentences[nextSentenceIdx]) {
+        playSentence(chapIdx, nextSentenceIdx, updatedBook);
+      }
+    },
+    [activeBook, currentChapterIndex, stopAudioPlayback, persistEditedBook, playSentence]
+  );
+
+  const handleSaveChapterEdit = useCallback(
+    async (chapIdx: number, newContent: string, playAfterSave = false) => {
+      if (!activeBook) return;
+      stopAudioPlayback();
+      audioBufferCacheRef.current.clear();
+
+      const targetChap = activeBook.chapters[chapIdx];
+      if (!targetChap) return;
+
+      const trimmedContent = newContent.trim();
+      const newSentences = splitIntoSentences(trimmedContent);
+      const updatedChapters = [...activeBook.chapters];
+      updatedChapters[chapIdx] = {
+        ...targetChap,
+        content: trimmedContent,
+        sentences: newSentences,
+      };
+
+      const cleanedFullText = updatedChapters.map((c) => c.content).join('\n\n');
+      const totalWords = cleanedFullText.trim()
+        ? cleanedFullText.trim().split(/\s+/).length
+        : 0;
+
+      const nextSentIdx = playAfterSave
+        ? 0
+        : Math.min(currentSentenceIndex, Math.max(0, newSentences.length - 1));
+
+      const updatedBook: Book = {
+        ...activeBook,
+        chapters: updatedChapters,
+        cleanedText: cleanedFullText,
+        wordCount: totalWords,
+        currentSentenceIndex:
+          chapIdx === currentChapterIndex ? nextSentIdx : activeBook.currentSentenceIndex,
+        updatedAt: Date.now(),
+      };
+
+      if (chapIdx === currentChapterIndex) {
+        setCurrentSentenceIndex(nextSentIdx);
+      }
+
+      await persistEditedBook(updatedBook);
+
+      if (playAfterSave && newSentences.length > 0) {
+        playSentence(chapIdx, 0, updatedBook);
+      }
+    },
+    [activeBook, currentChapterIndex, currentSentenceIndex, stopAudioPlayback, persistEditedBook, playSentence]
+  );
+
+  const handleReplaceInBook = useCallback(
+    async (
+      findText: string,
+      replaceText: string,
+      caseSensitive: boolean,
+      scope: 'chapter' | 'book'
+    ): Promise<number> => {
+      if (!activeBook || !findText) return 0;
+      stopAudioPlayback();
+      audioBufferCacheRef.current.clear();
+
+      const escaped = findText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const regex = new RegExp(escaped, caseSensitive ? 'g' : 'gi');
+      let totalMatches = 0;
+
+      const updatedChapters = activeBook.chapters.map((chap, idx) => {
+        if (scope === 'chapter' && idx !== currentChapterIndex) {
+          return chap;
+        }
+
+        const contentMatches = chap.content.match(regex);
+        if (!contentMatches || contentMatches.length === 0) {
+          // Still check sentences just in case
+          let sentMatched = false;
+          const nextSentences = chap.sentences.map((s) => {
+            const m = s.text.match(regex);
+            if (m && m.length > 0) {
+              sentMatched = true;
+              totalMatches += m.length;
+              const replaced = s.text.replace(regex, replaceText).trim();
+              return { ...s, text: replaced || s.text, cleanText: replaced || s.cleanText };
+            }
+            return s;
+          });
+          return sentMatched ? { ...chap, sentences: nextSentences } : chap;
+        }
+
+        totalMatches += contentMatches.length;
+        const nextContent = chap.content.replace(regex, replaceText);
+        const nextSentences = chap.sentences
+          .map((s) => {
+            const updatedText = s.text.replace(regex, replaceText).trim();
+            return {
+              ...s,
+              text: updatedText,
+              cleanText: updatedText,
+            };
+          })
+          .filter((s) => s.text.length > 0)
+          .map((s, sIdx) => ({ ...s, index: sIdx }));
+
+        return {
+          ...chap,
+          content: nextContent,
+          sentences: nextSentences,
+        };
+      });
+
+      if (totalMatches === 0) return 0;
+
+      const cleanedFullText = updatedChapters.map((c) => c.content).join('\n\n');
+      const totalWords = cleanedFullText.trim()
+        ? cleanedFullText.trim().split(/\s+/).length
+        : 0;
+
+      const activeChapLen = updatedChapters[currentChapterIndex]?.sentences.length || 1;
+      const safeSentIdx = Math.min(currentSentenceIndex, Math.max(0, activeChapLen - 1));
+      if (safeSentIdx !== currentSentenceIndex) {
+        setCurrentSentenceIndex(safeSentIdx);
+      }
+
+      const updatedBook: Book = {
+        ...activeBook,
+        chapters: updatedChapters,
+        cleanedText: cleanedFullText,
+        wordCount: totalWords,
+        currentSentenceIndex: safeSentIdx,
+        updatedAt: Date.now(),
+      };
+
+      await persistEditedBook(updatedBook);
+      return totalMatches;
+    },
+    [activeBook, currentChapterIndex, currentSentenceIndex, stopAudioPlayback, persistEditedBook]
+  );
+
   // 6. Delete Book from Library
   const handleDeleteBook = async (id: string) => {
     await dbDeleteBook(id);
@@ -942,6 +1234,7 @@ export default function App() {
           setIsLibraryOpen(false);
           setIsDictionaryOpen(false);
           setIsShortcutsOpen(false);
+          setTextEditorState((prev) => ({ ...prev, isOpen: false }));
           break;
       }
     };
@@ -1044,6 +1337,7 @@ export default function App() {
               setActiveBook(null);
             }}
             onOpenExporter={() => setIsExporterOpen(true)}
+            onOpenTextEditor={handleOpenTextEditor}
           />
         )}
       </div>
@@ -1140,6 +1434,22 @@ export default function App() {
         voiceSettings={voiceSettings}
         theme={theme}
       />
+
+      {activeBook && (
+        <TextEditorModal
+          isOpen={textEditorState.isOpen}
+          onClose={() => setTextEditorState((prev) => ({ ...prev, isOpen: false }))}
+          book={activeBook}
+          currentChapterIndex={currentChapterIndex}
+          initialSentenceIndex={textEditorState.sentenceIndex}
+          initialTab={textEditorState.tab}
+          voiceSettings={voiceSettings}
+          theme={theme}
+          onSaveSentence={handleSaveSentenceEdit}
+          onSaveChapter={handleSaveChapterEdit}
+          onReplaceInBook={handleReplaceInBook}
+        />
+      )}
     </div>
   );
 }
