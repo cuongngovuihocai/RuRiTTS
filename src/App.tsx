@@ -100,15 +100,7 @@ export default function App() {
   const [isLibraryOpen, setIsLibraryOpen] = useState(false);
   const [isDictionaryOpen, setIsDictionaryOpen] = useState(false);
   const [isShortcutsOpen, setIsShortcutsOpen] = useState(false);
-  const [textEditorState, setTextEditorState] = useState<{
-    isOpen: boolean;
-    tab: 'sentence' | 'chapter';
-    sentenceIndex: number;
-  }>({
-    isOpen: false,
-    tab: 'sentence',
-    sentenceIndex: 0,
-  });
+  const [isTextEditorOpen, setIsTextEditorOpen] = useState(false);
 
   // Audio Playback References
   const currentUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
@@ -847,21 +839,14 @@ export default function App() {
     }
   };
 
-  // 5b. Manual Spelling & Content Editing (Current/Upcoming Sentence, Chapter, or Bulk Replace)
-  const handleOpenTextEditor = useCallback(
-    (tab: 'sentence' | 'chapter' = 'sentence', sentenceIndex?: number) => {
-      if (!activeBook) return;
-      if (playbackState === 'playing' || playbackState === 'synthesizing') {
-        stopAudioPlayback();
-      }
-      setTextEditorState({
-        isOpen: true,
-        tab,
-        sentenceIndex: sentenceIndex ?? currentSentenceIndex,
-      });
-    },
-    [activeBook, playbackState, stopAudioPlayback, currentSentenceIndex]
-  );
+  // 5b. Manual Spelling & Content Editing (Full Chapter & Bulk Find/Replace)
+  const handleOpenTextEditor = useCallback(() => {
+    if (!activeBook) return;
+    if (playbackState === 'playing' || playbackState === 'synthesizing') {
+      stopAudioPlayback();
+    }
+    setIsTextEditorOpen(true);
+  }, [activeBook, playbackState, stopAudioPlayback]);
 
   const persistEditedBook = useCallback(async (updatedBook: Book) => {
     setActiveBook(updatedBook);
@@ -869,129 +854,6 @@ export default function App() {
     const updatedList = await getAllBooks();
     setSavedBooks(updatedList);
   }, []);
-
-  const handleSaveSentenceEdit = useCallback(
-    async (
-      chapIdx: number,
-      sentIdx: number,
-      newText: string,
-      playAfterSave = false
-    ) => {
-      if (!activeBook) return;
-      stopAudioPlayback();
-      audioBufferCacheRef.current.clear();
-
-      const targetChap = activeBook.chapters[chapIdx];
-      if (!targetChap) return;
-
-      const oldSentences = targetChap.sentences;
-      const oldSent = oldSentences[sentIdx];
-      if (!oldSent) return;
-
-      const trimmedNew = newText.trim();
-      let updatedSentences = [...oldSentences];
-      let updatedBookmarks = [...activeBook.bookmarks];
-      let updatedContent = targetChap.content || oldSentences.map((s) => s.text).join('\n\n');
-
-      // Locate exact position of this sentence in chapter.content to preserve paragraphs
-      let searchFrom = 0;
-      for (let k = 0; k < sentIdx; k++) {
-        const prevPos = updatedContent.indexOf(oldSentences[k].text, searchFrom);
-        if (prevPos !== -1) searchFrom = prevPos + oldSentences[k].text.length;
-      }
-      const targetPos = updatedContent.indexOf(oldSent.text, searchFrom);
-
-      let nextSentenceIdx = sentIdx;
-
-      if (!trimmedNew) {
-        // Delete empty/junk sentence
-        if (updatedSentences.length > 1) {
-          updatedSentences.splice(sentIdx, 1);
-          updatedSentences = updatedSentences.map((s, idx) => ({
-            ...s,
-            index: idx,
-          }));
-
-          updatedBookmarks = updatedBookmarks
-            .filter((b) => !(b.chapterIndex === chapIdx && b.sentenceIndex === sentIdx))
-            .map((b) =>
-              b.chapterIndex === chapIdx && b.sentenceIndex > sentIdx
-                ? { ...b, sentenceIndex: b.sentenceIndex - 1 }
-                : b
-            );
-
-          if (targetPos !== -1) {
-            updatedContent =
-              (
-                updatedContent.slice(0, targetPos) +
-                updatedContent.slice(targetPos + oldSent.text.length)
-              )
-                .replace(/\n{3,}/g, '\n\n')
-                .trim();
-          } else {
-            updatedContent = updatedSentences.map((s) => s.text).join('\n\n');
-          }
-
-          nextSentenceIdx = Math.min(sentIdx, updatedSentences.length - 1);
-        }
-      } else {
-        updatedSentences[sentIdx] = {
-          ...oldSent,
-          text: trimmedNew,
-          cleanText: trimmedNew,
-        };
-
-        updatedBookmarks = updatedBookmarks.map((b) =>
-          b.chapterIndex === chapIdx && b.sentenceIndex === sentIdx
-            ? { ...b, sentenceText: trimmedNew }
-            : b
-        );
-
-        if (targetPos !== -1) {
-          updatedContent =
-            updatedContent.slice(0, targetPos) +
-            trimmedNew +
-            updatedContent.slice(targetPos + oldSent.text.length);
-        } else {
-          updatedContent = updatedSentences.map((s) => s.text).join('\n\n');
-        }
-      }
-
-      const updatedChapters = [...activeBook.chapters];
-      updatedChapters[chapIdx] = {
-        ...targetChap,
-        content: updatedContent,
-        sentences: updatedSentences,
-      };
-
-      const cleanedFullText = updatedChapters.map((c) => c.content).join('\n\n');
-      const totalWords = cleanedFullText.trim()
-        ? cleanedFullText.trim().split(/\s+/).length
-        : 0;
-
-      const updatedBook: Book = {
-        ...activeBook,
-        chapters: updatedChapters,
-        cleanedText: cleanedFullText,
-        wordCount: totalWords,
-        currentSentenceIndex:
-          chapIdx === currentChapterIndex ? nextSentenceIdx : activeBook.currentSentenceIndex,
-        bookmarks: updatedBookmarks,
-        updatedAt: Date.now(),
-      };
-
-      if (chapIdx === currentChapterIndex) {
-        setCurrentSentenceIndex(nextSentenceIdx);
-      }
-
-      await persistEditedBook(updatedBook);
-
-      if (playAfterSave && updatedChapters[chapIdx]?.sentences[nextSentenceIdx]) {
-        playSentence(chapIdx, nextSentenceIdx, updatedBook);
-      }
-    },
-    [activeBook, currentChapterIndex, stopAudioPlayback, persistEditedBook, playSentence]
-  );
 
   const handleSaveChapterEdit = useCallback(
     async (chapIdx: number, newContent: string, playAfterSave = false) => {
@@ -1234,7 +1096,7 @@ export default function App() {
           setIsLibraryOpen(false);
           setIsDictionaryOpen(false);
           setIsShortcutsOpen(false);
-          setTextEditorState((prev) => ({ ...prev, isOpen: false }));
+          setIsTextEditorOpen(false);
           break;
       }
     };
@@ -1437,15 +1299,12 @@ export default function App() {
 
       {activeBook && (
         <TextEditorModal
-          isOpen={textEditorState.isOpen}
-          onClose={() => setTextEditorState((prev) => ({ ...prev, isOpen: false }))}
+          isOpen={isTextEditorOpen}
+          onClose={() => setIsTextEditorOpen(false)}
           book={activeBook}
           currentChapterIndex={currentChapterIndex}
-          initialSentenceIndex={textEditorState.sentenceIndex}
-          initialTab={textEditorState.tab}
           voiceSettings={voiceSettings}
           theme={theme}
-          onSaveSentence={handleSaveSentenceEdit}
           onSaveChapter={handleSaveChapterEdit}
           onReplaceInBook={handleReplaceInBook}
         />

@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useState } from 'react';
+import React, { useRef, useEffect } from 'react';
 import {
   Book,
   FontSize,
@@ -17,7 +17,6 @@ import {
   Loader2,
   Play,
   PencilLine,
-  Check,
 } from 'lucide-react';
 import { playSoundCue, speakAnnouncement } from '../services/audioSynthesizer';
 import { getThemeConfig } from '../utils/themeStyles';
@@ -38,7 +37,7 @@ interface ReaderViewProps {
   onDeepAiClean: () => void;
   onBackToInput: () => void;
   onOpenExporter: () => void;
-  onOpenTextEditor: (tab?: 'sentence' | 'chapter', sentenceIndex?: number) => void;
+  onOpenTextEditor: () => void;
 }
 
 export const ReaderView: React.FC<ReaderViewProps> = ({
@@ -58,7 +57,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
   onOpenExporter,
   onOpenTextEditor,
 }) => {
-  const [isTapToEditMode, setIsTapToEditMode] = useState(false);
   const currentChapter = book.chapters[currentChapterIndex] || book.chapters[0];
   const activeSentenceRef = useRef<HTMLSpanElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -105,10 +103,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
 
   const handleSentenceClick = (idx: number) => {
     if (voiceSettings.enableSoundCues) playSoundCue('click');
-    if (isTapToEditMode) {
-      onOpenTextEditor('sentence', idx);
-      return;
-    }
     onSelectSentence(idx);
     if (voiceSettings.enableSpokenGuide) {
       speakAnnouncement('Bắt đầu đọc từ vị trí này', voiceSettings);
@@ -164,11 +158,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
             type="button"
             onClick={() => {
               if (voiceSettings.enableSoundCues) playSoundCue('click');
-              onOpenTextEditor('sentence', currentSentenceIndex);
+              onOpenTextEditor();
             }}
             className={`flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs sm:text-sm font-bold ${themeConfig.cardInner} ${themeConfig.borderHighlight} transition-all active:scale-95 hover:opacity-90`}
-            title="Tự chỉnh sửa chính tả cho câu đang đọc, các câu sắp tới hoặc cả chương"
-            aria-label="Sửa chính tả nội dung đang hoặc sắp đọc"
+            title="Chỉnh sửa chính tả cả chương và tìm thay thế"
+            aria-label="Sửa chính tả"
           >
             <PencilLine className="w-4 h-4" />
             <span>Sửa chính tả</span>
@@ -250,69 +244,18 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       )}
 
       {/* Book & Chapter Header Info */}
-      <div className="mb-6 flex flex-wrap items-end justify-between gap-3">
-        <div className="space-y-1">
-          <h2 className={`text-2xl sm:text-3xl font-black ${themeConfig.isLight ? 'text-amber-900' : 'text-current'} tracking-tight`}>
-            {book.title}
-          </h2>
-          <div className={`flex items-center gap-3 text-xs sm:text-sm ${themeConfig.textSecondary} font-medium`}>
-            <span className={`px-2.5 py-0.5 rounded-full ${themeConfig.cardInner} ${themeConfig.border} font-bold`}>
-              {currentChapter?.title || 'Chương 1'}
-            </span>
-            <span>•</span>
-            <span>{book.wordCount} từ</span>
-          </div>
+      <div className="mb-6 space-y-1">
+        <h2 className={`text-2xl sm:text-3xl font-black ${themeConfig.isLight ? 'text-amber-900' : 'text-current'} tracking-tight`}>
+          {book.title}
+        </h2>
+        <div className={`flex items-center gap-3 text-xs sm:text-sm ${themeConfig.textSecondary} font-medium`}>
+          <span className={`px-2.5 py-0.5 rounded-full ${themeConfig.cardInner} ${themeConfig.border} font-bold`}>
+            {currentChapter?.title || 'Chương 1'}
+          </span>
+          <span>•</span>
+          <span>{book.wordCount} từ</span>
         </div>
-
-        <button
-          id="btn-toggle-tap-to-edit"
-          type="button"
-          onClick={() => {
-            if (voiceSettings.enableSoundCues) playSoundCue('click');
-            setIsTapToEditMode((prev) => !prev);
-          }}
-          className={`flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-bold border transition-all active:scale-95 ${
-            isTapToEditMode
-              ? `${themeConfig.accent} ${themeConfig.accentText} ${themeConfig.accentBorder} shadow-md`
-              : `${themeConfig.cardInner} ${themeConfig.border} ${themeConfig.textSecondary} hover:${themeConfig.textPrimary}`
-          }`}
-          title="Bật chế độ chạm trực tiếp vào bất kỳ câu nào để sửa chính tả"
-        >
-          {isTapToEditMode ? <Check className="w-3.5 h-3.5 stroke-[2.5]" /> : <PencilLine className="w-3.5 h-3.5" />}
-          <span>{isTapToEditMode ? 'Đang bật: Chạm câu để sửa' : 'Chạm câu để sửa'}</span>
-        </button>
       </div>
-
-      {/* Tap-to-Edit Active Banner */}
-      {isTapToEditMode && (
-        <div
-          role="status"
-          className={`mb-5 p-3.5 rounded-2xl ${themeConfig.cardInner} border-2 ${themeConfig.borderHighlight} flex flex-wrap items-center justify-between gap-3 shadow-md animate-in fade-in`}
-        >
-          <div className="flex items-center gap-2 text-xs sm:text-sm font-semibold">
-            <PencilLine className="w-4 h-4 flex-shrink-0" style={{ color: themeConfig.hex.accent }} />
-            <span>
-              <strong>Chế độ sửa chính tả:</strong> Chạm vào bất kỳ câu nào đang hoặc sắp đọc để chỉnh sửa ngay.
-            </span>
-          </div>
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={() => onOpenTextEditor('chapter', currentSentenceIndex)}
-              className={`px-3 py-1.5 rounded-xl text-xs font-bold ${themeConfig.card} border ${themeConfig.border} hover:opacity-90`}
-            >
-              Sửa cả chương
-            </button>
-            <button
-              type="button"
-              onClick={() => setIsTapToEditMode(false)}
-              className={`px-3 py-1.5 rounded-xl text-xs font-black ${themeConfig.accent} ${themeConfig.accentText}`}
-            >
-              Xong
-            </button>
-          </div>
-        </div>
-      )}
 
       {/* Auto Resume Saved Reading Position Quick Alert in Reader View */}
       {(book.currentChapterIndex > 0 || book.currentSentenceIndex > 0) && (
@@ -374,9 +317,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
                     : undefined
                 }
                 className={`inline cursor-pointer rounded px-0.5 py-0.5 mr-1.5 transition-all duration-150 relative ${
-                  isTapToEditMode
-                    ? 'underline decoration-dashed decoration-amber-400/60 underline-offset-4 hover:bg-amber-500/15'
-                    : isActive
+                  isActive
                     ? 'text-current'
                     : isBookmarked
                     ? 'border-b-2 border-amber-400 font-semibold'
