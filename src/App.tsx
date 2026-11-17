@@ -31,12 +31,13 @@ import {
   splitIntoSentences,
 } from './services/textCleaner';
 import {
-  decodeAudioBase64,
   getAvailableVietnameseVoices,
   getEmotionAcoustics,
-  pcmToAudioBuffer,
+  playBase64Audio,
   playSoundCue,
   speakAnnouncement,
+  stopSharedMediaPlayback,
+  unlockAudioForIOS,
 } from './services/audioSynthesizer';
 import {
   checkBackendHealth,
@@ -101,10 +102,10 @@ export default function App() {
 
   // Audio Playback References
   const currentUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
-  const audioContextSourceRef = useRef<AudioBufferSourceNode | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
+  const playbackSessionIdRef = useRef(0);
   const audioBufferCacheRef = useRef<Map<string, {
-    buffer: AudioBuffer;
+    audioBase64: string;
+    mimeType: string;
     isFallback: boolean;
     fallbackVoiceName?: string;
     fallbackReason?: string;
@@ -118,24 +119,14 @@ export default function App() {
     audioBufferCacheRef.current.clear();
   }, [voiceSettings.voiceId, voiceSettings.engine, voiceSettings.rate, voiceSettings.pitch, voiceSettings.emotion, activeBook?.id]);
 
-  const getAudioContext = useCallback(() => {
-    if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
-      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-      audioContextRef.current = new AudioContextClass();
-    }
-    if (audioContextRef.current.state === 'suspended') {
-      audioContextRef.current.resume().catch(() => {});
-    }
-    return audioContextRef.current;
-  }, []);
-
   // Active voice fallback indicator state
   const [activeFallbackNotice, setActiveFallbackNotice] = useState<FallbackNoticeInfo | null>(null);
 
-  // Helper to fetch and decode audio for a sentence with seamless gender-preserving fallback and fast timeout
+  // Helper to fetch audio payload for a sentence with seamless fallback and fast timeout
   const fetchSentenceAudioBuffer = useCallback(
     async (text: string, vSettings: VoiceSettings): Promise<{
-      buffer: AudioBuffer;
+      audioBase64: string;
+      mimeType: string;
       isFallback: boolean;
       fallbackVoiceName?: string;
       fallbackReason?: string;
@@ -160,8 +151,6 @@ export default function App() {
         }
       }
 
-      // On static hosting without a linked backend URL, return null immediately
-      // so App.tsx plays using native browser SpeechSynthesis instantly with zero delay.
       if (!hasBackendSupport()) {
         return null;
       }
@@ -179,9 +168,9 @@ export default function App() {
             18000
           );
           if (res?.audioBase64) {
-            const buf = await decodeAudioBase64(res.audioBase64);
             return {
-              buffer: buf,
+              audioBase64: res.audioBase64,
+              mimeType: res.mimeType || 'audio/mp3',
               isFallback: !!res.isFallback,
               fallbackVoiceName: res.fallbackVoiceName,
               fallbackReason: res.fallbackReason,
@@ -196,12 +185,12 @@ export default function App() {
               12000
             );
             if (fallbackRes?.audioBase64) {
-              const buf = await decodeAudioBase64(fallbackRes.audioBase64);
               return {
-                buffer: buf,
+                audioBase64: fallbackRes.audioBase64,
+                mimeType: fallbackRes.mimeType || 'audio/mp3',
                 isFallback: true,
-                fallbackVoiceName: 'Google Dịch TTS (Dự phòng Nam Bộ)',
-                fallbackReason: 'Không kết nối được giọng Edge TTS, tạm chuyển sang Google Dịch tinh chỉnh âm điệu Nam Bộ',
+                fallbackVoiceName: 'Google Dịch TTS (Dự phòng)',
+                fallbackReason: 'Không kết nối được giọng Edge TTS, tạm chuyển sang Google Dịch',
               };
             }
             return null;
@@ -216,9 +205,9 @@ export default function App() {
             12000
           );
           if (res?.audioBase64) {
-            const buf = await decodeAudioBase64(res.audioBase64);
             return {
-              buffer: buf,
+              audioBase64: res.audioBase64,
+              mimeType: res.mimeType || 'audio/mp3',
               isFallback: false,
             };
           }
@@ -430,23 +419,24 @@ export default function App() {
 
   // 2. Play Current Sentence Logic
   const stopAudioPlayback = useCallback(() => {
+    playbackSessionIdRef.current++;
     if ('speechSynthesis' in window) {
       window.speechSynthesis.cancel();
     }
-    if (audioContextSourceRef.current) {
-      try {
-        audioContextSourceRef.current.stop();
-      } catch {}
-      audioContextSourceRef.current = null;
-    }
+    stopSharedMediaPlayback();
     setPlaybackState('paused');
     releaseWakeLock();
   }, []);
 
   const playSentence = useCallback(
     async (chapIdx: number, sentIdx: number, targetBook?: Book) => {
+      // Unlock iOS Safari media session synchronously inside user tap BEFORE any await
+      unlockAudioForIOS();
+
       const currentBook = targetBook || activeBook;
       if (!currentBook) return;
+
+      const sessionId = ++playbackSessionIdRef.current;
 
       const chapter = currentBook.chapters[chapIdx];
       if (!chapter || !chapter.sentences[sentIdx]) {
@@ -484,12 +474,7 @@ export default function App() {
       if ('speechSynthesis' in window) {
         window.speechSynthesis.cancel();
       }
-      if (audioContextSourceRef.current) {
-        try {
-          audioContextSourceRef.current.stop();
-        } catch {}
-        audioContextSourceRef.current = null;
-      }
+      stopSharedMediaPlayback();
 
       // Compute dynamic acoustic modifiers based on EmotionStyle
       const emotionAcoustics = getEmotionAcoustics(voiceSettings.emotion);
@@ -497,10 +482,10 @@ export default function App() {
       const effectivePitch = Math.max(0.5, Math.min(1.5, voiceSettings.pitch * emotionAcoustics.pitchMultiplier));
       const effectiveVolume = Math.max(0, Math.min(1.0, voiceSettings.volume * emotionAcoustics.volumeMultiplier));
 
-      // Trigger background prefetching for the next 5 sentences immediately
+      // Trigger background prefetching for the next 3 sentences immediately
       prefetchUpcoming(chapIdx, sentIdx + 1, currentBook);
 
-      // Route 1, 2, 3: Online Neural Audio (Edge, Google Translate, Gemini)
+      // Route 1, 2: Online Neural Audio (Edge, Google Translate)
       if (voiceSettings.engine !== 'native' && !isOffline) {
         try {
           const cacheKey = `${voiceSettings.engine}_${voiceSettings.voiceId}_${chapIdx}_${sentIdx}`;
@@ -509,6 +494,7 @@ export default function App() {
           if (!cached) {
             setPlaybackState('synthesizing');
             const res = await fetchSentenceAudioBuffer(textToRead, voiceSettings);
+            if (sessionId !== playbackSessionIdRef.current) return;
             if (res) {
               cached = res;
               if (audioBufferCacheRef.current.size > 60) {
@@ -519,8 +505,10 @@ export default function App() {
             }
           }
 
-          if (!cached || !cached.buffer) {
-            throw new Error('Failed to obtain audio buffer');
+          if (sessionId !== playbackSessionIdRef.current) return;
+
+          if (!cached || !cached.audioBase64) {
+            throw new Error('Failed to obtain audio payload');
           }
 
           if (cached.isFallback) {
@@ -533,31 +521,32 @@ export default function App() {
             setActiveFallbackNotice(null);
           }
 
-          const ctx = getAudioContext();
-          if (ctx.state === 'suspended') {
-            await ctx.resume().catch(() => {});
-          }
+          // Edge TTS already embeds rate/pitch in SSML unless it fell back to Google Translate
+          const mediaRate =
+            voiceSettings.engine === 'edge' && !cached.isFallback ? 1.0 : effectiveRate;
 
-          const source = ctx.createBufferSource();
-          source.buffer = cached.buffer;
-
-          const gainNode = ctx.createGain();
-          gainNode.gain.value = effectiveVolume;
-
-          source.playbackRate.value = effectiveRate;
-          source.connect(gainNode);
-          gainNode.connect(ctx.destination);
-
-          audioContextSourceRef.current = source;
-          setPlaybackState('playing');
-          source.start();
-
-          source.onended = () => {
-            if (isPlayingRef.current) {
-              playSentence(chapIdx, sentIdx + 1, currentBook);
-            }
-          };
+          await playBase64Audio(cached.audioBase64, {
+            rate: mediaRate,
+            volume: effectiveVolume,
+            mimeType: cached.mimeType,
+            onStart: () => {
+              if (sessionId === playbackSessionIdRef.current) {
+                setPlaybackState('playing');
+              }
+            },
+            onEnded: () => {
+              if (sessionId === playbackSessionIdRef.current && isPlayingRef.current) {
+                playSentence(chapIdx, sentIdx + 1, currentBook);
+              }
+            },
+            onError: () => {
+              if (sessionId === playbackSessionIdRef.current && isPlayingRef.current) {
+                speakNativeSentence(textToRead, chapIdx, sentIdx, effectiveRate, effectivePitch, effectiveVolume, currentBook);
+              }
+            },
+          });
         } catch (error) {
+          if (sessionId !== playbackSessionIdRef.current) return;
           console.warn('Audio synthesis fallback to native Web Speech:', error);
           setPlaybackState('playing');
           setActiveFallbackNotice({
@@ -574,7 +563,7 @@ export default function App() {
         speakNativeSentence(textToRead, chapIdx, sentIdx, effectiveRate, effectivePitch, effectiveVolume, currentBook);
       }
     },
-    [activeBook, voiceSettings, isOffline, sleepTimerMinutes, stopAudioPlayback, prefetchUpcoming, fetchSentenceAudioBuffer, getAudioContext]
+    [activeBook, voiceSettings, isOffline, sleepTimerMinutes, stopAudioPlayback, prefetchUpcoming, fetchSentenceAudioBuffer]
   );
 
   const speakNativeSentence = (
@@ -692,6 +681,7 @@ export default function App() {
 
   // Resume playback directly for a book
   const handleResumeBook = useCallback((book: Book) => {
+    unlockAudioForIOS();
     setActiveBook(book);
     const chap = book.currentChapterIndex || 0;
     const sent = book.currentSentenceIndex || 0;
@@ -706,6 +696,7 @@ export default function App() {
 
   // 3. Load Book Content from Text / File / Camera (Checks for matching book with saved progress)
   const handleLoadContent = async (title: string, rawText: string) => {
+    unlockAudioForIOS();
     const cleaned = cleanVietnameseTextOffline(rawText, dictionary);
     const chapters = buildChaptersFromText(cleaned);
     const wordCount = cleaned.trim().split(/\s+/).length;

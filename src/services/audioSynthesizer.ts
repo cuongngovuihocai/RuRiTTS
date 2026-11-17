@@ -2,16 +2,269 @@ import { Mp3Encoder } from '@breezystack/lamejs';
 import { EmotionStyle, VietnameseVoice, VoiceSettings } from '../types';
 
 let audioCtx: AudioContext | null = null;
+let sharedMediaEl: HTMLAudioElement | null = null;
+let activeMediaObjectUrl: string | null = null;
+let activeFallbackBufferSource: AudioBufferSourceNode | null = null;
+let currentPlayGeneration = 0;
+let isMediaElUnlocked = false;
+let hasRegisteredGestureUnlock = false;
+
+// Tiny 44-byte silent WAV data URI for unlocking HTMLAudioElement on iOS Safari user gestures
+const SILENT_WAV_DATA_URI =
+  'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
 
 function getAudioContext(): AudioContext {
-  if (!audioCtx) {
+  if (!audioCtx || audioCtx.state === 'closed') {
     const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
     audioCtx = new AudioContextClass();
   }
   if (audioCtx.state === 'suspended') {
-    audioCtx.resume();
+    audioCtx.resume().catch(() => {});
   }
   return audioCtx;
+}
+
+function getSharedMediaElement(): HTMLAudioElement | null {
+  if (typeof window === 'undefined' || typeof Audio === 'undefined') return null;
+  if (!sharedMediaEl) {
+    sharedMediaEl = new Audio();
+    sharedMediaEl.preload = 'auto';
+    (sharedMediaEl as any).playsInline = true;
+    sharedMediaEl.setAttribute('playsinline', '');
+    sharedMediaEl.setAttribute('webkit-playsinline', '');
+  }
+  return sharedMediaEl;
+}
+
+/**
+ * Synchronously unlock both HTMLAudioElement and AudioContext inside a user gesture
+ * so subsequent async fetch(...) audio playback works on iPhone / iOS Safari.
+ */
+export function unlockAudioForIOS(): void {
+  if (typeof window === 'undefined') return;
+
+  // 1. Unlock shared AudioContext synchronously
+  try {
+    const ctx = getAudioContext();
+    if (ctx.state === 'suspended') {
+      ctx.resume().catch(() => {});
+    }
+    const silentBuffer = ctx.createBuffer(1, 1, 22050);
+    const source = ctx.createBufferSource();
+    source.buffer = silentBuffer;
+    source.connect(ctx.destination);
+    source.start(0);
+  } catch {}
+
+  // 2. Unlock persistent HTMLAudioElement synchronously
+  try {
+    const el = getSharedMediaElement();
+    if (el && !isMediaElUnlocked) {
+      // Do not interrupt if real media is currently playing
+      const isPlayingRealAudio =
+        !el.paused && Boolean(el.src) && !el.src.startsWith('data:audio/wav;base64,UklGRig');
+      if (!isPlayingRealAudio) {
+        isMediaElUnlocked = true;
+        el.muted = true;
+        el.src = SILENT_WAV_DATA_URI;
+        const playPromise = el.play();
+        if (playPromise && typeof playPromise.then === 'function') {
+          playPromise
+            .then(() => {
+              if (el.src === SILENT_WAV_DATA_URI) {
+                el.pause();
+                el.muted = false;
+              }
+            })
+            .catch(() => {
+              isMediaElUnlocked = false;
+              el.muted = false;
+            });
+        } else {
+          el.muted = false;
+        }
+      }
+    }
+  } catch {
+    isMediaElUnlocked = false;
+  }
+}
+
+function ensureGlobalGestureUnlock(): void {
+  if (typeof document === 'undefined' || hasRegisteredGestureUnlock) return;
+  hasRegisteredGestureUnlock = true;
+
+  const onFirstGesture = () => {
+    unlockAudioForIOS();
+    if (isMediaElUnlocked) {
+      document.removeEventListener('touchstart', onFirstGesture, true);
+      document.removeEventListener('pointerdown', onFirstGesture, true);
+      document.removeEventListener('click', onFirstGesture, true);
+    }
+  };
+
+  document.addEventListener('touchstart', onFirstGesture, { capture: true, passive: true });
+  document.addEventListener('pointerdown', onFirstGesture, { capture: true, passive: true });
+  document.addEventListener('click', onFirstGesture, { capture: true, passive: true });
+}
+
+if (typeof document !== 'undefined') {
+  ensureGlobalGestureUnlock();
+}
+
+export function stopSharedMediaPlayback(): void {
+  currentPlayGeneration++;
+
+  if (sharedMediaEl) {
+    try {
+      sharedMediaEl.onended = null;
+      sharedMediaEl.onerror = null;
+      sharedMediaEl.pause();
+      if (sharedMediaEl.currentTime > 0) {
+        sharedMediaEl.currentTime = 0;
+      }
+    } catch {}
+  }
+
+  if (activeFallbackBufferSource) {
+    try {
+      activeFallbackBufferSource.onended = null;
+      activeFallbackBufferSource.stop();
+      activeFallbackBufferSource.disconnect();
+    } catch {}
+    activeFallbackBufferSource = null;
+  }
+}
+
+export interface PlayBase64AudioOptions {
+  rate?: number;
+  volume?: number;
+  mimeType?: string;
+  onStart?: () => void;
+  onEnded?: () => void;
+  onError?: (err: unknown) => void;
+}
+
+/**
+ * Play base64 MP3/WAV audio reliably across iOS Safari, Android Chrome, and Desktop.
+ * Uses persistent unlocked HTMLAudioElement first (works even with iPhone side Silent switch ON),
+ * with automatic fallback to AudioContext buffer playback.
+ */
+export async function playBase64Audio(
+  base64Audio: string,
+  options: PlayBase64AudioOptions = {}
+): Promise<boolean> {
+  const {
+    rate = 1.0,
+    volume = 1.0,
+    mimeType = 'audio/mpeg',
+    onStart,
+    onEnded,
+    onError,
+  } = options;
+
+  stopSharedMediaPlayback();
+  const playId = ++currentPlayGeneration;
+
+  const normalizedMime = mimeType === 'audio/mp3' ? 'audio/mpeg' : mimeType;
+  const clampedRate = Math.max(0.5, Math.min(3.0, rate));
+  const clampedVolume = Math.max(0, Math.min(1.0, volume));
+
+  const el = getSharedMediaElement();
+  if (el) {
+    try {
+      const bytes = base64ToUint8Array(base64Audio);
+      const blob = new Blob([new Uint8Array(bytes)], { type: normalizedMime });
+      const nextUrl = URL.createObjectURL(blob);
+      const prevUrl = activeMediaObjectUrl;
+      activeMediaObjectUrl = nextUrl;
+
+      el.muted = false;
+      el.volume = clampedVolume;
+      el.playbackRate = clampedRate;
+      el.preservesPitch = true;
+      (el as any).webkitPreservesPitch = true;
+      el.src = nextUrl;
+
+      if (prevUrl) {
+        setTimeout(() => {
+          try {
+            URL.revokeObjectURL(prevUrl);
+          } catch {}
+        }, 500);
+      }
+
+      let endedHandled = false;
+      el.onended = () => {
+        if (endedHandled || playId !== currentPlayGeneration) return;
+        endedHandled = true;
+        onEnded?.();
+      };
+
+      el.onerror = () => {
+        if (endedHandled || playId !== currentPlayGeneration) return;
+        endedHandled = true;
+        onError?.(new Error('HTMLAudioElement playback error'));
+      };
+
+      await el.play();
+
+      if (playId !== currentPlayGeneration) {
+        try {
+          el.pause();
+        } catch {}
+        return false;
+      }
+
+      isMediaElUnlocked = true;
+      onStart?.();
+      return true;
+    } catch (htmlAudioErr: any) {
+      if (playId !== currentPlayGeneration) return false;
+      console.warn('HTMLAudioElement play failed, trying AudioContext fallback:', htmlAudioErr?.name || htmlAudioErr);
+    }
+  }
+
+  // Secondary fallback via shared unlocked AudioContext
+  try {
+    const buffer = await decodeAudioBase64(base64Audio);
+    if (playId !== currentPlayGeneration) return false;
+
+    const ctx = getAudioContext();
+    if (ctx.state === 'suspended') {
+      await ctx.resume();
+    }
+    if (playId !== currentPlayGeneration) return false;
+
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+
+    const gainNode = ctx.createGain();
+    gainNode.gain.value = clampedVolume;
+
+    source.playbackRate.value = clampedRate;
+    source.connect(gainNode);
+    gainNode.connect(ctx.destination);
+
+    activeFallbackBufferSource = source;
+    source.onended = () => {
+      if (activeFallbackBufferSource === source) {
+        activeFallbackBufferSource = null;
+      }
+      if (playId === currentPlayGeneration) {
+        onEnded?.();
+      }
+    };
+
+    source.start();
+    onStart?.();
+    return true;
+  } catch (ctxErr) {
+    if (playId === currentPlayGeneration) {
+      onError?.(ctxErr);
+    }
+    throw ctxErr;
+  }
 }
 
 // 1. Accessibility Audio Feedback Beeps (Phản hồi âm thanh trợ năng)
@@ -411,7 +664,7 @@ export function getAvailableVietnameseVoices(): Promise<VietnameseVoice[]> {
   });
 }
 
-// 4. Convert Base64 MP3 / Audio to Playable AudioBuffer
+// 4. Convert Base64 MP3 / Audio to Playable AudioBuffer (Safari callback & Promise safe)
 export async function decodeAudioBase64(base64Audio: string): Promise<AudioBuffer> {
   const binaryString = window.atob(base64Audio);
   const len = binaryString.length;
@@ -420,7 +673,33 @@ export async function decodeAudioBase64(base64Audio: string): Promise<AudioBuffe
     bytes[i] = binaryString.charCodeAt(i);
   }
   const ctx = getAudioContext();
-  return await ctx.decodeAudioData(bytes.buffer.slice(0));
+  if (ctx.state === 'suspended') {
+    await ctx.resume().catch(() => {});
+  }
+  const arrayBuffer = bytes.buffer.slice(0);
+  return await new Promise<AudioBuffer>((resolve, reject) => {
+    let settled = false;
+    const onSuccess = (decoded: AudioBuffer) => {
+      if (!settled) {
+        settled = true;
+        resolve(decoded);
+      }
+    };
+    const onFailure = (err: any) => {
+      if (!settled) {
+        settled = true;
+        reject(err || new Error('decodeAudioData failed'));
+      }
+    };
+    try {
+      const maybePromise = ctx.decodeAudioData(arrayBuffer, onSuccess, onFailure);
+      if (maybePromise && typeof maybePromise.then === 'function') {
+        maybePromise.then(onSuccess, onFailure);
+      }
+    } catch (err) {
+      onFailure(err);
+    }
+  });
 }
 
 

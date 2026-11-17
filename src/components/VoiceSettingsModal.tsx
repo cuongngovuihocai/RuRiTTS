@@ -23,12 +23,13 @@ import {
 } from 'lucide-react';
 import { EmotionStyle, VietnameseVoice, VoiceSettings, ThemeMode } from '../types';
 import {
-  decodeAudioBase64,
   getEmotionAcoustics,
   getVoiceSamplePreviewText,
-  pcmToAudioBuffer,
+  playBase64Audio,
   playSoundCue,
   speakAnnouncement,
+  stopSharedMediaPlayback,
+  unlockAudioForIOS,
 } from '../services/audioSynthesizer';
 import {
   generateEdgeSpeech,
@@ -105,21 +106,15 @@ export const VoiceSettingsModal: React.FC<VoiceSettingsModalProps> = ({
 }) => {
   const [previewingVoiceId, setPreviewingVoiceId] = useState<string | null>(null);
   const [loadingVoiceId, setLoadingVoiceId] = useState<string | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const activeSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const previewGenRef = useRef(0);
 
   const themeConfig = getThemeConfig(theme as ThemeMode);
   const activeHighlight = voiceSettings.highlightColor || '#f59e0b';
 
   // Stop audio when modal closes or unmounts
   const stopCurrentPreview = () => {
-    if (activeSourceRef.current) {
-      try {
-        activeSourceRef.current.stop();
-        activeSourceRef.current.disconnect();
-      } catch {}
-      activeSourceRef.current = null;
-    }
+    previewGenRef.current++;
+    stopSharedMediaPlayback();
     if ('speechSynthesis' in window) {
       window.speechSynthesis.cancel();
     }
@@ -165,6 +160,9 @@ export const VoiceSettingsModal: React.FC<VoiceSettingsModalProps> = ({
   const handlePlayVoicePreview = async (targetVoice: VietnameseVoice, e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
 
+    // Unlock iOS Safari media element & AudioContext synchronously on tap BEFORE any await
+    unlockAudioForIOS();
+
     // If already playing this voice, stop it
     if (previewingVoiceId === targetVoice.id) {
       stopCurrentPreview();
@@ -172,6 +170,7 @@ export const VoiceSettingsModal: React.FC<VoiceSettingsModalProps> = ({
     }
 
     stopCurrentPreview();
+    const myGen = ++previewGenRef.current;
     setLoadingVoiceId(targetVoice.id);
     if (voiceSettings.enableSoundCues) playSoundCue('click');
 
@@ -182,6 +181,7 @@ export const VoiceSettingsModal: React.FC<VoiceSettingsModalProps> = ({
     const effectiveVolume = Math.max(0, Math.min(1.0, voiceSettings.volume * emotionAcoustics.volumeMultiplier));
 
     const playWithNative = () => {
+      if (myGen !== previewGenRef.current) return;
       if ('speechSynthesis' in window) {
         window.speechSynthesis.cancel();
         const utterance = new SpeechSynthesisUtterance(sampleText);
@@ -206,8 +206,12 @@ export const VoiceSettingsModal: React.FC<VoiceSettingsModalProps> = ({
         setLoadingVoiceId(null);
         setPreviewingVoiceId(targetVoice.id);
 
-        utterance.onend = () => setPreviewingVoiceId(null);
-        utterance.onerror = () => setPreviewingVoiceId(null);
+        utterance.onend = () => {
+          if (myGen === previewGenRef.current) setPreviewingVoiceId(null);
+        };
+        utterance.onerror = () => {
+          if (myGen === previewGenRef.current) setPreviewingVoiceId(null);
+        };
         window.speechSynthesis.speak(utterance);
       } else {
         setLoadingVoiceId(null);
@@ -224,63 +228,90 @@ export const VoiceSettingsModal: React.FC<VoiceSettingsModalProps> = ({
             effectivePitch,
             effectiveVolume
           );
-          let buffer = await decodeAudioBase64(res.audioBase64);
+          if (myGen !== previewGenRef.current) return;
 
-          if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
-            const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-            audioContextRef.current = new AudioContextClass();
+          const mediaRate = res.isFallback ? effectiveRate : 1.0;
+          await playBase64Audio(res.audioBase64, {
+            rate: mediaRate,
+            volume: effectiveVolume,
+            mimeType: res.mimeType || 'audio/mp3',
+            onStart: () => {
+              if (myGen === previewGenRef.current) {
+                setLoadingVoiceId(null);
+                setPreviewingVoiceId(targetVoice.id);
+              }
+            },
+            onEnded: () => {
+              if (myGen === previewGenRef.current) {
+                setPreviewingVoiceId(null);
+              }
+            },
+            onError: () => {
+              if (myGen === previewGenRef.current) {
+                setLoadingVoiceId(null);
+                setPreviewingVoiceId(null);
+              }
+            },
+          });
+        } catch (err) {
+          console.warn('Edge preview failed, trying Google Translate preview:', err);
+          if (myGen !== previewGenRef.current) return;
+          try {
+            const gtRes = await generateGoogleTranslateSpeech(sampleText, targetVoice.id);
+            if (myGen !== previewGenRef.current) return;
+            await playBase64Audio(gtRes.audioBase64, {
+              rate: effectiveRate,
+              volume: effectiveVolume,
+              mimeType: gtRes.mimeType || 'audio/mp3',
+              onStart: () => {
+                if (myGen === previewGenRef.current) {
+                  setLoadingVoiceId(null);
+                  setPreviewingVoiceId(targetVoice.id);
+                }
+              },
+              onEnded: () => {
+                if (myGen === previewGenRef.current) {
+                  setPreviewingVoiceId(null);
+                }
+              },
+              onError: () => {
+                if (myGen === previewGenRef.current) {
+                  setLoadingVoiceId(null);
+                  setPreviewingVoiceId(null);
+                }
+              },
+            });
+          } catch {
+            playWithNative();
           }
-          if (audioContextRef.current.state === 'suspended') {
-            await audioContextRef.current.resume();
-          }
-
-          const source = audioContextRef.current.createBufferSource();
-          source.buffer = buffer;
-          source.connect(audioContextRef.current.destination);
-          activeSourceRef.current = source;
-          setLoadingVoiceId(null);
-          setPreviewingVoiceId(targetVoice.id);
-
-          source.onended = () => {
-            setPreviewingVoiceId(null);
-            activeSourceRef.current = null;
-          };
-          source.start();
-        } catch {
-          playWithNative();
         }
       } else if (hasBackendSupport() && targetVoice.engine === 'google-translate' && !isOffline) {
         try {
           const res = await generateGoogleTranslateSpeech(sampleText, targetVoice.id);
-          const buffer = await decodeAudioBase64(res.audioBase64);
+          if (myGen !== previewGenRef.current) return;
 
-          if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
-            const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-            audioContextRef.current = new AudioContextClass();
-          }
-          if (audioContextRef.current.state === 'suspended') {
-            await audioContextRef.current.resume();
-          }
-
-          const ctx = audioContextRef.current;
-          const source = ctx.createBufferSource();
-          source.buffer = buffer;
-
-          const gainNode = ctx.createGain();
-          gainNode.gain.value = effectiveVolume;
-
-          source.playbackRate.value = effectiveRate;
-          source.connect(gainNode);
-          gainNode.connect(ctx.destination);
-          activeSourceRef.current = source;
-          setLoadingVoiceId(null);
-          setPreviewingVoiceId(targetVoice.id);
-
-          source.onended = () => {
-            setPreviewingVoiceId(null);
-            activeSourceRef.current = null;
-          };
-          source.start();
+          await playBase64Audio(res.audioBase64, {
+            rate: effectiveRate,
+            volume: effectiveVolume,
+            mimeType: res.mimeType || 'audio/mp3',
+            onStart: () => {
+              if (myGen === previewGenRef.current) {
+                setLoadingVoiceId(null);
+                setPreviewingVoiceId(targetVoice.id);
+              }
+            },
+            onEnded: () => {
+              if (myGen === previewGenRef.current) {
+                setPreviewingVoiceId(null);
+              }
+            },
+            onError: () => {
+              if (myGen === previewGenRef.current) {
+                setLoadingVoiceId(null);
+                setPreviewingVoiceId(null);
+              }
+            },
+          });
         } catch {
           playWithNative();
         }
