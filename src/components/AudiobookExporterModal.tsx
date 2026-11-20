@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import JSZip from 'jszip';
 import {
   X,
@@ -11,6 +11,9 @@ import {
   Music,
   Zap,
   Lock,
+  ListChecks,
+  CheckSquare,
+  Square,
 } from 'lucide-react';
 import { Book, VietnameseVoice, VoiceSettings, ThemeMode } from '../types';
 import {
@@ -127,19 +130,52 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
       ? 'Google TTS'
       : 'Giọng thiết bị (Offline)';
 
-  const [exportScope, setExportScope] = useState<'single_full' | 'current' | 'zip_chapters'>(
-    isMultiChapter ? 'single_full' : 'current'
+  const [exportScope, setExportScope] = useState<
+    'single_full' | 'current' | 'selected_chapters' | 'zip_chapters'
+  >(isMultiChapter ? 'single_full' : 'current');
+  const [selectedDeliveryMode, setSelectedDeliveryMode] = useState<'zip' | 'separate'>('zip');
+  const [selectedChapterIndices, setSelectedChapterIndices] = useState<number[]>(() => [
+    Math.min(book.currentChapterIndex || 0, Math.max(0, book.chapters.length - 1)),
+  ]);
+  const [rangeFrom, setRangeFrom] = useState<string>('1');
+  const [rangeTo, setRangeTo] = useState<string>(() =>
+    String(Math.min(5, Math.max(1, book.chapters.length)))
   );
   const [exportFormat, setExportFormat] = useState<'mp3' | 'wav'>('mp3');
   const [isExporting, setIsExporting] = useState(false);
-  const [progress, setProgress] = useState({
+  const [progress, setProgress] = useState<{
+    status: string;
+    currentChapter: number;
+    totalChapters: number;
+    message: string;
+    downloadUrl: string;
+    fileName: string;
+    separateFiles: { fileName: string; url: string; title: string; isPartial?: boolean }[];
+  }>({
     status: 'idle', // 'idle' | 'generating' | 'zipping' | 'completed' | 'error'
     currentChapter: 0,
     totalChapters: 0,
     message: '',
     downloadUrl: '',
     fileName: '',
+    separateFiles: [],
   });
+
+  // Keep selected chapters valid when book changes or modal reopens
+  useEffect(() => {
+    const valid = selectedChapterIndices.filter((idx) => idx >= 0 && idx < book.chapters.length);
+    if (valid.length === 0 && book.chapters.length > 0) {
+      const fallbackIdx = Math.min(book.currentChapterIndex || 0, book.chapters.length - 1);
+      setSelectedChapterIndices([fallbackIdx]);
+    } else if (valid.length !== selectedChapterIndices.length) {
+      setSelectedChapterIndices(valid);
+    }
+    if (book.chapters.length <= 1 && (exportScope === 'selected_chapters' || exportScope === 'zip_chapters')) {
+      setExportScope('current');
+    }
+    setRangeFrom('1');
+    setRangeTo(String(Math.min(5, Math.max(1, book.chapters.length))));
+  }, [book.id, book.chapters.length, isOpen]);
 
   if (!isOpen) return null;
 
@@ -297,10 +333,46 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
     document.body.removeChild(a);
   };
 
+  const toggleChapterSelection = (idx: number) => {
+    if (isExporting) return;
+    setSelectedChapterIndices((prev) =>
+      prev.includes(idx) ? prev.filter((x) => x !== idx) : [...prev, idx].sort((a, b) => a - b)
+    );
+  };
+
+  const handleSelectAllChapters = () => {
+    if (isExporting) return;
+    setSelectedChapterIndices(book.chapters.map((_, i) => i));
+  };
+
+  const handleClearSelectedChapters = () => {
+    if (isExporting) return;
+    setSelectedChapterIndices([]);
+  };
+
+  const handleApplyChapterRange = () => {
+    if (isExporting) return;
+    const total = book.chapters.length;
+    const startNum = Math.max(1, Math.min(total, parseInt(rangeFrom, 10) || 1));
+    const endNum = Math.max(startNum, Math.min(total, parseInt(rangeTo, 10) || startNum));
+    const rangeIndices: number[] = [];
+    for (let idx = startNum - 1; idx < endNum; idx++) {
+      rangeIndices.push(idx);
+    }
+    setSelectedChapterIndices(rangeIndices);
+    setRangeFrom(String(startNum));
+    setRangeTo(String(endNum));
+  };
+
   const handleStartExport = async () => {
     if (progress.downloadUrl) {
       try {
         URL.revokeObjectURL(progress.downloadUrl);
+      } catch {}
+    }
+    for (const f of progress.separateFiles) {
+      try {
+        URL.revokeObjectURL(f.url);
       } catch {}
     }
 
@@ -317,12 +389,22 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
       message: `Đang khởi tạo âm thanh .${fileExt.toUpperCase()}...`,
       downloadUrl: '',
       fileName: '',
+      separateFiles: [],
     });
 
     // Trackers for partial valid audio recovery if connection drops mid-export
     const singlePartialTracker = { chunks: [] as string[], total: 0 };
     const completedZipTracks: { index: number; title: string; trackName: string; blob: Blob }[] = [];
     const failedChapterPartials: { index: number; title: string; tracker: { chunks: string[]; total: number } }[] = [];
+    const isMultiScope = exportScope === 'zip_chapters' || exportScope === 'selected_chapters';
+    const activeTargetIndices =
+      exportScope === 'zip_chapters'
+        ? book.chapters.map((_, idx) => idx)
+        : exportScope === 'selected_chapters'
+        ? [...selectedChapterIndices].sort((a, b) => a - b)
+        : [];
+    const activeDelivery: 'zip' | 'separate' =
+      exportScope === 'selected_chapters' ? selectedDeliveryMode : 'zip';
 
     try {
       if (exportScope === 'single_full') {
@@ -341,6 +423,7 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
               message: `Đang kết xuất đoạn ${done}/${total} thành file .${fileExt.toUpperCase()}...`,
               downloadUrl: '',
               fileName: '',
+              separateFiles: [],
             });
           },
           singlePartialTracker
@@ -356,6 +439,7 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
           message: `Đã tạo xong file âm thanh "${fileName}"! Đang tự động tải về...`,
           downloadUrl: url,
           fileName,
+          separateFiles: [],
         });
 
         triggerAutoDownload(url, fileName);
@@ -376,6 +460,7 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
               message: `Đang tạo đoạn ${done}/${total} chương "${chapter.title}"...`,
               downloadUrl: '',
               fileName: '',
+              separateFiles: [],
             });
           },
           singlePartialTracker
@@ -391,32 +476,37 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
           message: `Đã hoàn thành xuất file .${fileExt.toUpperCase()} chương "${chapter.title}"! Đang tải về...`,
           downloadUrl: url,
           fileName,
+          separateFiles: [],
         });
 
         triggerAutoDownload(url, fileName);
         if (voiceSettings.enableSoundCues) playSoundCue('success');
       } else {
-        // 3. Export separate chapter audio files in a clean ZIP package:
+        // 3. Export multiple selected chapters (or all chapters):
         // - Google TTS: parallel batching (3 chapters/batch) for fast speed
         // - Microsoft Edge TTS: sequential chapter processing to prevent Bing WebSocket throttling
-        const chapters = book.chapters;
-        const total = chapters.length;
-        const zip = new JSZip();
+        if (activeTargetIndices.length === 0) {
+          throw new Error('Vui lòng chọn ít nhất 1 chương để xuất file audio.');
+        }
+
+        const total = activeTargetIndices.length;
+        const padDigits = Math.max(2, String(book.chapters.length).length);
 
         if (voiceSettings.engine === 'google-translate') {
           const BATCH_SIZE = 3;
           let completedCount = 0;
 
           for (let i = 0; i < total; i += BATCH_SIZE) {
-            const batch = chapters.slice(i, i + BATCH_SIZE);
+            const batchIndices = activeTargetIndices.slice(i, i + BATCH_SIZE);
             const batchResults = await Promise.allSettled(
-              batch.map(async (chap, batchIdx) => {
-                const actualIdx = i + batchIdx;
+              batchIndices.map(async (actualIdx) => {
+                const chap = book.chapters[actualIdx];
+                if (!chap) return;
                 const tracker = { chunks: [] as string[], total: 0 };
                 const textContent = chap.sentences.map((s) => s.text).join(' ');
                 try {
                   const audioBlob = await synthesizeTextToAudio(textContent, exportFormat, undefined, tracker);
-                  const paddedIndex = String(actualIdx + 1).padStart(2, '0');
+                  const paddedIndex = String(actualIdx + 1).padStart(padDigits, '0');
                   const trackName = `${paddedIndex}_${sanitizeFileName(chap.title)}.${fileExt}`;
                   completedZipTracks.push({ index: actualIdx, title: chap.title, trackName, blob: audioBlob });
 
@@ -428,6 +518,7 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
                     message: `Đang xử lý song song: đã xong ${completedCount}/${total} chương...`,
                     downloadUrl: '',
                     fileName: '',
+                    separateFiles: [],
                   });
                 } catch (chapErr) {
                   if (tracker.chunks.length > 0) {
@@ -444,18 +535,21 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
             }
           }
         } else {
-          for (let i = 0; i < total; i++) {
-            const chap = chapters[i];
+          for (let pos = 0; pos < total; pos++) {
+            const actualIdx = activeTargetIndices[pos];
+            const chap = book.chapters[actualIdx];
+            if (!chap) continue;
             const tracker = { chunks: [] as string[], total: 0 };
             const textContent = chap.sentences.map((s) => s.text).join(' ');
 
             setProgress({
               status: 'generating',
-              currentChapter: i,
+              currentChapter: pos,
               totalChapters: total,
-              message: `Đang xử lý chương ${i + 1}/${total}: "${chap.title}"...`,
+              message: `Đang xử lý ${pos + 1}/${total}: "${chap.title}"...`,
               downloadUrl: '',
               fileName: '',
+              separateFiles: [],
             });
 
             try {
@@ -465,35 +559,37 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
                 (done, chunkTotal) => {
                   setProgress({
                     status: 'generating',
-                    currentChapter: i,
+                    currentChapter: pos,
                     totalChapters: total,
-                    message: `Chương ${i + 1}/${total} ("${chap.title}"): đoạn ${done}/${chunkTotal}...`,
+                    message: `Đang xử lý ${pos + 1}/${total} ("${chap.title}"): đoạn ${done}/${chunkTotal}...`,
                     downloadUrl: '',
                     fileName: '',
+                    separateFiles: [],
                   });
                 },
                 tracker
               );
 
-              const paddedIndex = String(i + 1).padStart(2, '0');
+              const paddedIndex = String(actualIdx + 1).padStart(padDigits, '0');
               const trackName = `${paddedIndex}_${sanitizeFileName(chap.title)}.${fileExt}`;
-              completedZipTracks.push({ index: i, title: chap.title, trackName, blob: audioBlob });
+              completedZipTracks.push({ index: actualIdx, title: chap.title, trackName, blob: audioBlob });
 
               setProgress({
                 status: 'generating',
-                currentChapter: i + 1,
+                currentChapter: pos + 1,
                 totalChapters: total,
-                message: `Đã xong ${i + 1}/${total} chương: "${chap.title}"`,
+                message: `Đã xong ${pos + 1}/${total}: "${chap.title}"`,
                 downloadUrl: '',
                 fileName: '',
+                separateFiles: [],
               });
 
-              if (i < total - 1) {
+              if (pos < total - 1) {
                 await new Promise((r) => setTimeout(r, 200));
               }
             } catch (chapErr) {
               if (tracker.chunks.length > 0) {
-                failedChapterPartials.push({ index: i, title: chap.title, tracker });
+                failedChapterPartials.push({ index: actualIdx, title: chap.title, tracker });
               }
               throw chapErr;
             }
@@ -501,55 +597,88 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
         }
 
         completedZipTracks.sort((a, b) => a.index - b.index);
-        for (const track of completedZipTracks) {
-          zip.file(track.trackName, track.blob);
-        }
 
-        // Add lightweight JSON metadata (NO heavy/redundant txt transcript)
-        const metadata = {
-          title: book.title,
-          author: book.author || 'Tác giả',
-          totalChapters: total,
-          totalWords: book.wordCount,
-          audioFormat: fileExt.toUpperCase(),
-          voiceEngine: voiceSettings.engine,
-          voiceId: voiceSettings.voiceId,
-          voiceName: selectedVoiceName,
-          strictSingleVoice: true,
-          exportedAt: new Date().toISOString(),
-          chapters: completedZipTracks.map((t) => ({
-            track: t.index + 1,
+        if (activeDelivery === 'separate') {
+          const separateFiles = completedZipTracks.map((t) => ({
             fileName: t.trackName,
+            url: URL.createObjectURL(t.blob),
             title: t.title,
-          })),
-        };
-        zip.file('thong_tin_audio.json', JSON.stringify(metadata, null, 2));
+          }));
 
-        setProgress((prev) => ({
-          ...prev,
-          status: 'zipping',
-          message: 'Đang nén file âm thanh các chương...',
-        }));
+          setProgress({
+            status: 'completed',
+            currentChapter: total,
+            totalChapters: total,
+            message: `Đã tạo xong ${separateFiles.length} file .${fileExt.toUpperCase()} riêng lẻ! Đang kích hoạt tải xuống...`,
+            downloadUrl: '',
+            fileName: '',
+            separateFiles,
+          });
 
-        const zipBlob = await zip.generateAsync({
-          type: 'blob',
-          compression: 'STORE', // Audio is already compressed, STORE is fast
-        });
+          // Trigger staggered auto-downloads; user can also tap any file directly in the list below if browser blocks multi-download
+          separateFiles.forEach((file, idx) => {
+            setTimeout(() => {
+              triggerAutoDownload(file.url, file.fileName);
+            }, idx * 350);
+          });
+          if (voiceSettings.enableSoundCues) playSoundCue('success');
+        } else {
+          const zip = new JSZip();
+          for (const track of completedZipTracks) {
+            zip.file(track.trackName, track.blob);
+          }
 
-        const url = URL.createObjectURL(zipBlob);
-        const fileName = `${safeTitle}_Audio_TronBo_${fileExt.toUpperCase()}.zip`;
+          // Add lightweight JSON metadata (NO heavy/redundant txt transcript)
+          const metadata = {
+            title: book.title,
+            author: book.author || 'Tác giả',
+            totalChapters: completedZipTracks.length,
+            totalBookChapters: book.chapters.length,
+            totalWords: book.wordCount,
+            audioFormat: fileExt.toUpperCase(),
+            voiceEngine: voiceSettings.engine,
+            voiceId: voiceSettings.voiceId,
+            voiceName: selectedVoiceName,
+            strictSingleVoice: true,
+            exportedAt: new Date().toISOString(),
+            chapters: completedZipTracks.map((t) => ({
+              track: t.index + 1,
+              fileName: t.trackName,
+              title: t.title,
+            })),
+          };
+          zip.file('thong_tin_audio.json', JSON.stringify(metadata, null, 2));
 
-        setProgress({
-          status: 'completed',
-          currentChapter: total,
-          totalChapters: total,
-          message: `Đã nén xong trọn bộ ${total} file âm thanh! Đang tải về...`,
-          downloadUrl: url,
-          fileName,
-        });
+          setProgress((prev) => ({
+            ...prev,
+            status: 'zipping',
+            message: 'Đang nén file âm thanh các chương...',
+          }));
 
-        triggerAutoDownload(url, fileName);
-        if (voiceSettings.enableSoundCues) playSoundCue('success');
+          const zipBlob = await zip.generateAsync({
+            type: 'blob',
+            compression: 'STORE', // Audio is already compressed, STORE is fast
+          });
+
+          const url = URL.createObjectURL(zipBlob);
+          const fileName =
+            exportScope === 'zip_chapters'
+              ? `${safeTitle}_Audio_TronBo_${fileExt.toUpperCase()}.zip`
+              : `${safeTitle}_Audio_DaChon_${completedZipTracks.length}chuong_${fileExt.toUpperCase()}.zip`;
+
+          setProgress({
+            status: 'completed',
+            currentChapter: total,
+            totalChapters: total,
+            message: `Đã nén xong ${completedZipTracks.length} file âm thanh! Đang tải về...`,
+            downloadUrl: url,
+            fileName,
+            separateFiles: [],
+          });
+
+          triggerAutoDownload(url, fileName);
+          if (voiceSettings.enableSoundCues) playSoundCue('success');
+        }
       }
 
       if (voiceSettings.enableSpokenGuide) {
@@ -560,33 +689,65 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
       let partialUrl = '';
       let partialFileName = '';
       let partialNote = '';
+      const partialSeparateFiles: { fileName: string; url: string; title: string; isPartial?: boolean }[] = [];
 
       try {
-        if (exportScope === 'zip_chapters' && (completedZipTracks.length > 0 || failedChapterPartials.length > 0)) {
-          const partialZip = new JSZip();
+        if (isMultiScope && (completedZipTracks.length > 0 || failedChapterPartials.length > 0)) {
+          const padDigits = Math.max(2, String(book.chapters.length).length);
+          const expectedCount = activeTargetIndices.length || book.chapters.length;
           completedZipTracks.sort((a, b) => a.index - b.index);
-          for (const track of completedZipTracks) {
-            partialZip.file(track.trackName, track.blob);
-          }
 
-          let partialChapterCount = 0;
-          for (const fp of failedChapterPartials) {
-            if (fp.tracker.chunks.length > 0) {
-              const partialBlob = await buildAudioBlobFromBase64Chunks(fp.tracker.chunks, exportFormat);
-              const paddedIndex = String(fp.index + 1).padStart(2, '0');
-              const trackName = `${paddedIndex}_${sanitizeFileName(fp.title)}_(DANG_DO_${fp.tracker.chunks.length}tren${fp.tracker.total}).${fileExt}`;
-              partialZip.file(trackName, partialBlob);
-              partialChapterCount++;
+          if (activeDelivery === 'separate') {
+            for (const track of completedZipTracks) {
+              partialSeparateFiles.push({
+                fileName: track.trackName,
+                url: URL.createObjectURL(track.blob),
+                title: track.title,
+              });
             }
-          }
+            let partialChapterCount = 0;
+            for (const fp of failedChapterPartials) {
+              if (fp.tracker.chunks.length > 0) {
+                const partialBlob = await buildAudioBlobFromBase64Chunks(fp.tracker.chunks, exportFormat);
+                const paddedIndex = String(fp.index + 1).padStart(padDigits, '0');
+                const trackName = `${paddedIndex}_${sanitizeFileName(fp.title)}_(DANG_DO_${fp.tracker.chunks.length}tren${fp.tracker.total}).${fileExt}`;
+                partialSeparateFiles.push({
+                  fileName: trackName,
+                  url: URL.createObjectURL(partialBlob),
+                  title: fp.title,
+                  isPartial: true,
+                });
+                partialChapterCount++;
+              }
+            }
+            partialNote = ` Đã giữ lại ${completedZipTracks.length}/${expectedCount} file hoàn chỉnh${
+              partialChapterCount > 0 ? ` và ${partialChapterCount} file đang đọc dở (gắn nhãn "(DANG_DO_...)")` : ''
+            } bên dưới để bạn tải về.`;
+          } else {
+            const partialZip = new JSZip();
+            for (const track of completedZipTracks) {
+              partialZip.file(track.trackName, track.blob);
+            }
 
-          const partialZipBlob = await partialZip.generateAsync({ type: 'blob', compression: 'STORE' });
-          partialUrl = URL.createObjectURL(partialZipBlob);
-          partialFileName = `${safeTitle}_Audio_(DANG_DO_${completedZipTracks.length}tren${book.chapters.length}_chuong)_${fileExt.toUpperCase()}.zip`;
-          partialNote = ` Đã lưu sẵn ${completedZipTracks.length}/${book.chapters.length} chương hoàn chỉnh${
-            partialChapterCount > 0 ? ` và ${partialChapterCount} file đang đọc dở (được gắn nhãn "(DANG_DO_...)" trong tên file)` : ''
-          } để bạn tải về bên dưới.`;
-        } else if (exportScope !== 'zip_chapters' && singlePartialTracker.chunks.length > 0) {
+            let partialChapterCount = 0;
+            for (const fp of failedChapterPartials) {
+              if (fp.tracker.chunks.length > 0) {
+                const partialBlob = await buildAudioBlobFromBase64Chunks(fp.tracker.chunks, exportFormat);
+                const paddedIndex = String(fp.index + 1).padStart(padDigits, '0');
+                const trackName = `${paddedIndex}_${sanitizeFileName(fp.title)}_(DANG_DO_${fp.tracker.chunks.length}tren${fp.tracker.total}).${fileExt}`;
+                partialZip.file(trackName, partialBlob);
+                partialChapterCount++;
+              }
+            }
+
+            const partialZipBlob = await partialZip.generateAsync({ type: 'blob', compression: 'STORE' });
+            partialUrl = URL.createObjectURL(partialZipBlob);
+            partialFileName = `${safeTitle}_Audio_(DANG_DO_${completedZipTracks.length}tren${expectedCount}_chuong)_${fileExt.toUpperCase()}.zip`;
+            partialNote = ` Đã lưu sẵn ${completedZipTracks.length}/${expectedCount} chương hoàn chỉnh${
+              partialChapterCount > 0 ? ` và ${partialChapterCount} file đang đọc dở (được gắn nhãn "(DANG_DO_...)" trong tên file)` : ''
+            } để bạn tải về bên dưới.`;
+          }
+        } else if (!isMultiScope && singlePartialTracker.chunks.length > 0) {
           const partialBlob = await buildAudioBlobFromBase64Chunks(singlePartialTracker.chunks, exportFormat);
           partialUrl = URL.createObjectURL(partialBlob);
           const baseName =
@@ -607,6 +768,7 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
         message: (err?.message || 'Có lỗi xảy ra trong quá trình tạo file âm thanh.') + partialNote,
         downloadUrl: partialUrl,
         fileName: partialFileName,
+        separateFiles: partialSeparateFiles,
       });
       if (voiceSettings.enableSoundCues) playSoundCue('error');
     } finally {
@@ -621,7 +783,7 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
       aria-labelledby="exporter-modal-title"
       className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-200"
     >
-      <div className={`${themeConfig.card} border-2 ${themeConfig.border} rounded-3xl w-full max-w-xl flex flex-col shadow-2xl overflow-hidden ${themeConfig.textPrimary}`}>
+      <div className={`${themeConfig.card} border-2 ${themeConfig.border} rounded-3xl w-full max-w-xl max-h-[90vh] flex flex-col shadow-2xl overflow-hidden ${themeConfig.textPrimary}`}>
         {/* Header */}
         <div className={`flex items-center justify-between p-5 border-b ${themeConfig.border} ${themeConfig.cardInner}`}>
           <div className="flex items-center gap-3">
@@ -649,7 +811,7 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
         </div>
 
         {/* Content Body */}
-        <div className="p-6 space-y-5">
+        <div className="p-5 sm:p-6 space-y-5 overflow-y-auto flex-1">
           {/* Scope Selector */}
           <div className="space-y-2">
             <label className={`text-xs font-bold ${themeConfig.textSecondary} uppercase tracking-wider block`}>
@@ -670,16 +832,16 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
                 <div className="flex items-center justify-between mb-1.5">
                   <div className="flex items-center gap-2">
                     <Zap className="w-4 h-4 stroke-[2.5]" />
-                    <span className="text-sm font-black">1 File duy nhất (.MP3)</span>
+                    <span className="text-sm font-black">1 File duy nhất (.{exportFormat.toUpperCase()})</span>
                   </div>
                   <span className={`text-[10px] px-1.5 py-0.5 rounded font-black ${
                     exportScope === 'single_full' ? `${themeConfig.card} ${themeConfig.textPrimary}` : `${themeConfig.card} ${themeConfig.textSecondary}`
                   }`}>
-                    Nhanh nhất
+                    Liền mạch
                   </span>
                 </div>
                 <p className={`text-xs ${exportScope === 'single_full' ? 'opacity-90 font-semibold' : themeConfig.textSecondary}`}>
-                  Tải 1 file âm thanh duy nhất để nghe liền mạch ngay, không cần giải nén ZIP
+                  Ghép toàn bộ sách thành 1 file âm thanh duy nhất để nghe liền mạch
                 </p>
               </button>
 
@@ -699,17 +861,46 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
                   <span className="text-sm font-black">Chỉ chương hiện tại</span>
                 </div>
                 <p className={`text-xs ${exportScope === 'current' ? 'opacity-90 font-semibold' : themeConfig.textSecondary}`}>
-                  Tải 1 file .MP3 của chương "{currentChapter.title.length > 25 ? currentChapter.title.slice(0, 25) + '...' : currentChapter.title}"
+                  Tải 1 file .{exportFormat.toUpperCase()} của chương "{currentChapter.title.length > 25 ? currentChapter.title.slice(0, 25) + '...' : currentChapter.title}"
                 </p>
               </button>
 
-              {/* Option 3: Multi-chapter ZIP (Only shown if book has multiple chapters) */}
+              {/* Option 3: User-selected multiple chapters */}
+              {isMultiChapter && (
+                <button
+                  type="button"
+                  onClick={() => setExportScope('selected_chapters')}
+                  disabled={isExporting}
+                  className={`p-4 rounded-2xl border text-left transition-all ${
+                    exportScope === 'selected_chapters'
+                      ? `${themeConfig.accent} ${themeConfig.accentText} ${themeConfig.accentBorder} font-bold shadow-md`
+                      : `${themeConfig.cardInner} hover:opacity-95 ${themeConfig.textPrimary} ${themeConfig.border}`
+                  }`}
+                >
+                  <div className="flex items-center justify-between mb-1.5">
+                    <div className="flex items-center gap-2">
+                      <ListChecks className="w-4 h-4" />
+                      <span className="text-sm font-black">Chọn nhiều chương</span>
+                    </div>
+                    <span className={`text-[10px] px-1.5 py-0.5 rounded font-black ${
+                      exportScope === 'selected_chapters' ? `${themeConfig.card} ${themeConfig.textPrimary}` : `${themeConfig.card} ${themeConfig.textSecondary}`
+                    }`}>
+                      {selectedChapterIndices.length}/{book.chapters.length}
+                    </span>
+                  </div>
+                  <p className={`text-xs ${exportScope === 'selected_chapters' ? 'opacity-90 font-semibold' : themeConfig.textSecondary}`}>
+                    Tự chọn nhiều chương muốn xuất 1 lúc (.ZIP hoặc tải từng file rời)
+                  </p>
+                </button>
+              )}
+
+              {/* Option 4: All chapters ZIP */}
               {isMultiChapter && (
                 <button
                   type="button"
                   onClick={() => setExportScope('zip_chapters')}
                   disabled={isExporting}
-                  className={`sm:col-span-2 p-4 rounded-2xl border text-left transition-all ${
+                  className={`p-4 rounded-2xl border text-left transition-all ${
                     exportScope === 'zip_chapters'
                       ? `${themeConfig.accent} ${themeConfig.accentText} ${themeConfig.accentBorder} font-bold shadow-md`
                       : `${themeConfig.cardInner} hover:opacity-95 ${themeConfig.textPrimary} ${themeConfig.border}`
@@ -718,21 +909,151 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
                   <div className="flex items-center justify-between mb-1.5">
                     <div className="flex items-center gap-2">
                       <FileArchive className="w-4 h-4" />
-                      <span className="text-sm font-black">Chia từng chương riêng biệt (.ZIP)</span>
+                      <span className="text-sm font-black">Toàn bộ từng chương (.ZIP)</span>
                     </div>
                     <span className={`text-[10px] px-1.5 py-0.5 rounded font-black ${
                       exportScope === 'zip_chapters' ? `${themeConfig.card} ${themeConfig.textPrimary}` : `${themeConfig.card} ${themeConfig.textSecondary}`
                     }`}>
-                      {book.chapters.length} tracks
+                      {book.chapters.length} files
                     </span>
                   </div>
                   <p className={`text-xs ${exportScope === 'zip_chapters' ? 'opacity-90 font-semibold' : themeConfig.textSecondary}`}>
-                    Chỉ đóng gói các file audio từng chương + tệp thông tin (đã loại bỏ hoàn toàn các file văn bản thừa)
+                    Xuất toàn bộ các chương thành nhiều file audio riêng đóng gói .ZIP
                   </p>
                 </button>
               )}
             </div>
           </div>
+
+          {/* Multi-Chapter Selection Panel (when 'selected_chapters' is active) */}
+          {isMultiChapter && exportScope === 'selected_chapters' && (
+            <div className={`p-3.5 rounded-2xl ${themeConfig.cardInner} border ${themeConfig.border} space-y-3`}>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-xs font-black" style={{ color: themeConfig.hex.accent }}>
+                  Danh sách chương ({selectedChapterIndices.length}/{book.chapters.length} đã chọn)
+                </span>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={handleSelectAllChapters}
+                    disabled={isExporting}
+                    className={`px-2.5 py-1 rounded-lg text-[11px] font-bold ${themeConfig.card} border ${themeConfig.border} hover:opacity-90 disabled:opacity-40`}
+                  >
+                    Chọn tất cả
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleClearSelectedChapters}
+                    disabled={isExporting}
+                    className={`px-2.5 py-1 rounded-lg text-[11px] font-bold ${themeConfig.card} border ${themeConfig.border} hover:opacity-90 disabled:opacity-40`}
+                  >
+                    Bỏ chọn
+                  </button>
+                </div>
+              </div>
+
+              {/* Quick Range Picker */}
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <span className={`${themeConfig.textSecondary} font-semibold`}>Chọn nhanh từ chương</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={book.chapters.length}
+                  value={rangeFrom}
+                  onChange={(e) => setRangeFrom(e.target.value)}
+                  disabled={isExporting}
+                  className={`w-14 px-2 py-1 rounded-lg ${themeConfig.card} border ${themeConfig.border} text-center font-bold`}
+                  aria-label="Từ chương số"
+                />
+                <span className={`${themeConfig.textSecondary} font-semibold`}>đến</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={book.chapters.length}
+                  value={rangeTo}
+                  onChange={(e) => setRangeTo(e.target.value)}
+                  disabled={isExporting}
+                  className={`w-14 px-2 py-1 rounded-lg ${themeConfig.card} border ${themeConfig.border} text-center font-bold`}
+                  aria-label="Đến chương số"
+                />
+                <button
+                  type="button"
+                  onClick={handleApplyChapterRange}
+                  disabled={isExporting}
+                  className={`px-2.5 py-1 rounded-lg text-[11px] font-black ${themeConfig.accent} ${themeConfig.accentText} active:scale-95 disabled:opacity-40`}
+                >
+                  Chọn khoảng
+                </button>
+              </div>
+
+              {/* Scrollable Chapter Checkboxes */}
+              <div className="max-h-40 overflow-y-auto space-y-1.5 pr-1">
+                {book.chapters.map((chap, idx) => {
+                  const isChecked = selectedChapterIndices.includes(idx);
+                  return (
+                    <button
+                      key={chap.id}
+                      type="button"
+                      onClick={() => toggleChapterSelection(idx)}
+                      disabled={isExporting}
+                      className={`w-full flex items-center justify-between gap-2 px-3 py-2 rounded-xl border text-left text-xs transition-all ${
+                        isChecked
+                          ? `${themeConfig.card} ${themeConfig.borderHighlight} font-bold`
+                          : `${themeConfig.card} ${themeConfig.border} opacity-75 hover:opacity-100`
+                      }`}
+                    >
+                      <span className="flex items-center gap-2 min-w-0">
+                        {isChecked ? (
+                          <CheckSquare className="w-4 h-4 flex-shrink-0" style={{ color: themeConfig.hex.accent }} />
+                        ) : (
+                          <Square className={`w-4 h-4 flex-shrink-0 ${themeConfig.textSecondary}`} />
+                        )}
+                        <span className="truncate">
+                          {idx + 1}. {chap.title}
+                        </span>
+                      </span>
+                      <span className={`text-[10px] ${themeConfig.textSecondary} flex-shrink-0`}>
+                        {chap.sentences.length} câu
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* Delivery Format for Selected Chapters */}
+              <div className="pt-2 border-t border-white/10 space-y-1.5">
+                <span className={`text-[11px] font-bold ${themeConfig.textSecondary} block`}>
+                  Cách nhận nhiều file:
+                </span>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setSelectedDeliveryMode('zip')}
+                    disabled={isExporting}
+                    className={`px-3 py-2 rounded-xl border text-xs font-bold text-left transition-all ${
+                      selectedDeliveryMode === 'zip'
+                        ? `${themeConfig.accent} ${themeConfig.accentText} ${themeConfig.accentBorder}`
+                        : `${themeConfig.card} ${themeConfig.border} ${themeConfig.textSecondary}`
+                    }`}
+                  >
+                    Đóng gói 1 tệp .ZIP (Khuyên dùng)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedDeliveryMode('separate')}
+                    disabled={isExporting}
+                    className={`px-3 py-2 rounded-xl border text-xs font-bold text-left transition-all ${
+                      selectedDeliveryMode === 'separate'
+                        ? `${themeConfig.accent} ${themeConfig.accentText} ${themeConfig.accentBorder}`
+                        : `${themeConfig.card} ${themeConfig.border} ${themeConfig.textSecondary}`
+                    }`}
+                  >
+                    Tải rời từng file .{exportFormat.toUpperCase()}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Format Selector: MP3 vs WAV */}
           <div className="space-y-2">
@@ -812,11 +1133,15 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
             )}
             <div className="flex justify-between">
               <span className={`font-bold ${themeConfig.textSecondary}`}>Kết quả xuất:</span>
-              <span className="text-emerald-400 font-bold">
+              <span className="text-emerald-400 font-bold text-right">
                 {exportScope === 'single_full'
                   ? `1 file duy nhất .${exportFormat.toUpperCase()} (Tải trực tiếp)`
                   : exportScope === 'current'
                   ? `1 file .${exportFormat.toUpperCase()} chương hiện tại`
+                  : exportScope === 'selected_chapters'
+                  ? selectedDeliveryMode === 'separate'
+                    ? `${selectedChapterIndices.length} file .${exportFormat.toUpperCase()} riêng lẻ`
+                    : `Tệp .ZIP chứa ${selectedChapterIndices.length} file audio đã chọn`
                   : `Tệp .ZIP chứa ${book.chapters.length} file audio`}
               </span>
             </div>
@@ -855,7 +1180,7 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
                 </div>
               )}
 
-              {/* Download Ready Button */}
+              {/* Download Ready Button (Single or ZIP) */}
               {progress.status === 'completed' && progress.downloadUrl && (
                 <div className="pt-2">
                   <a
@@ -866,6 +1191,23 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
                     <Download className="w-5 h-5 stroke-[2.5]" />
                     <span>Tải lại file ({progress.fileName})</span>
                   </a>
+                </div>
+              )}
+
+              {/* Download Ready List (Separate Multiple Files) */}
+              {progress.status === 'completed' && progress.separateFiles.length > 0 && (
+                <div className="pt-2 space-y-1.5 max-h-48 overflow-y-auto pr-1">
+                  {progress.separateFiles.map((file) => (
+                    <a
+                      key={file.fileName}
+                      href={file.url}
+                      download={file.fileName}
+                      className="w-full flex items-center justify-between gap-2 py-2.5 px-3.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-stone-950 font-black text-xs shadow active:scale-98 transition-all"
+                    >
+                      <span className="truncate">{file.fileName}</span>
+                      <Download className="w-4 h-4 flex-shrink-0 stroke-[2.5]" />
+                    </a>
+                  ))}
                 </div>
               )}
 
@@ -886,6 +1228,24 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
                       <span className="truncate">Tải phần âm thanh đã hoàn thành ({progress.fileName})</span>
                     </a>
                   )}
+
+                  {progress.separateFiles.length > 0 && (
+                    <div className="space-y-1.5 max-h-44 overflow-y-auto pr-1">
+                      {progress.separateFiles.map((file) => (
+                        <a
+                          key={file.fileName}
+                          href={file.url}
+                          download={file.fileName}
+                          className={`w-full flex items-center justify-between gap-2 py-2.5 px-3.5 rounded-xl ${
+                            file.isPartial ? 'bg-amber-500 hover:bg-amber-400' : 'bg-emerald-500 hover:bg-emerald-400'
+                          } text-stone-950 font-black text-xs shadow active:scale-98 transition-all`}
+                        >
+                          <span className="truncate">{file.fileName}</span>
+                          <Download className="w-4 h-4 flex-shrink-0 stroke-[2.5]" />
+                        </a>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -905,7 +1265,11 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
           <button
             type="button"
             onClick={handleStartExport}
-            disabled={isExporting || isNativeVoiceSelected}
+            disabled={
+              isExporting ||
+              isNativeVoiceSelected ||
+              (exportScope === 'selected_chapters' && selectedChapterIndices.length === 0)
+            }
             className={`flex items-center gap-2 px-6 py-2.5 rounded-xl text-xs sm:text-sm font-black ${themeConfig.accent} ${themeConfig.accentHover} ${themeConfig.accentText} shadow-md transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed`}
           >
             {isExporting ? (
