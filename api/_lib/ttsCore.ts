@@ -2,8 +2,15 @@ import * as cheerio from 'cheerio';
 import WebSocket from 'ws';
 import crypto from 'crypto';
 
-function escapeXmlText(str: string): string {
+function sanitizeTextForTts(str: string): string {
   return str
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\uFFFD]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function escapeXmlText(str: string): string {
+  return sanitizeTextForTts(str)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
@@ -13,7 +20,7 @@ function escapeXmlText(str: string): string {
 
 // Fetch Google Translate TTS audio chunks
 export async function fetchGoogleTranslateAudio(text: string): Promise<Buffer> {
-  const cleanText = text.trim();
+  const cleanText = sanitizeTextForTts(text);
   const chunkStrings: string[] = [];
   if (cleanText.length <= 180) {
     chunkStrings.push(cleanText);
@@ -51,6 +58,9 @@ export async function fetchGoogleTranslateAudio(text: string): Promise<Buffer> {
     }
 
     const arrayBuf = await response.arrayBuffer();
+    if (arrayBuf.byteLength === 0) {
+      throw new Error('Google Translate TTS trả về dữ liệu âm thanh rỗng');
+    }
     audioBuffers.push(Buffer.from(arrayBuf));
   }
 
@@ -414,7 +424,7 @@ async function synthesizeEdgeDirectRaw(
   userPitch = 1.0,
   userRate = 1.0,
   userVolume = 1.0,
-  timeoutMs = 7000
+  timeoutMs = 7500
 ): Promise<Buffer> {
   const profile = EDGE_VOICE_PROFILES[voice] || EDGE_VOICE_PROFILES['vi-VN-HoaiMyNeural'];
   const chosenBaseVoice = profile.baseVoice;
@@ -430,7 +440,9 @@ async function synthesizeEdgeDirectRaw(
   const prosodyVolume = Math.round(Math.min(1.0, Math.max(0, userVolume)) * 100);
   const ssmlVolume = `${prosodyVolume}%`;
 
-  const safeChunk = escapeXmlText(chunkText.trim());
+  const cleanedRaw = sanitizeTextForTts(chunkText);
+  const safeChunk = escapeXmlText(cleanedRaw);
+  const hasSpeakableContent = /[\p{L}\p{N}]/u.test(cleanedRaw);
   const secMsGEC = generateSecMsGecV2();
   const muid = generateEdgeMuid();
   const reqId = crypto.randomUUID().replace(/-/g, '');
@@ -450,6 +462,7 @@ async function synthesizeEdgeDirectRaw(
 
     const audioChunks: Buffer[] = [];
     let hasSettled = false;
+    let receivedTurnEnd = false;
     const ssml = `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="vi-VN"><voice name="${chosenBaseVoice}"><prosody pitch="${ssmlPitch}" rate="${ssmlRate}" volume="${ssmlVolume}">${safeChunk}</prosody></voice></speak>`;
 
     const settleResolve = (data: Buffer) => {
@@ -463,18 +476,20 @@ async function synthesizeEdgeDirectRaw(
       }
     };
 
-    const timeout = setTimeout(() => {
+    const settleReject = (err: Error) => {
       if (!hasSettled) {
         hasSettled = true;
+        clearTimeout(timeout);
         try {
           ws.close();
         } catch {}
-        if (audioChunks.length > 0) {
-          resolve(Buffer.concat(audioChunks));
-        } else {
-          reject(new Error('Edge TTS WebSocket timed out'));
-        }
+        reject(err);
       }
+    };
+
+    const timeout = setTimeout(() => {
+      // Never accept partial audio if Path:turn.end was not received
+      settleReject(new Error('Edge TTS WebSocket timed out before stream completed (turn.end missing)'));
     }, timeoutMs);
 
     ws.on('open', () => {
@@ -490,7 +505,13 @@ async function synthesizeEdgeDirectRaw(
       const str = buf.toString('utf8', 0, Math.min(buf.length, 300));
 
       if (str.includes('Path:turn.end')) {
-        settleResolve(Buffer.concat(audioChunks));
+        receivedTurnEnd = true;
+        const fullAudio = Buffer.concat(audioChunks);
+        if (hasSpeakableContent && fullAudio.length < 128) {
+          settleReject(new Error('Edge TTS returned empty or truncated audio despite turn.end'));
+          return;
+        }
+        settleResolve(fullAudio);
         return;
       }
 
@@ -507,29 +528,13 @@ async function synthesizeEdgeDirectRaw(
     });
 
     ws.on('error', (err) => {
-      if (!hasSettled) {
-        hasSettled = true;
-        clearTimeout(timeout);
-        try {
-          ws.close();
-        } catch {}
-        if (audioChunks.length > 0) {
-          resolve(Buffer.concat(audioChunks));
-        } else {
-          reject(err);
-        }
-      }
+      settleReject(err instanceof Error ? err : new Error(String(err)));
     });
 
     ws.on('close', () => {
-      if (!hasSettled) {
-        hasSettled = true;
-        clearTimeout(timeout);
-        if (audioChunks.length > 0) {
-          resolve(Buffer.concat(audioChunks));
-        } else {
-          reject(new Error('Edge TTS WebSocket closed without audio'));
-        }
+      if (!receivedTurnEnd) {
+        // Reject even if partial audio chunks arrived, so no sentences are silently skipped
+        settleReject(new Error('Edge TTS WebSocket closed prematurely before turn.end'));
       }
     });
   });
@@ -541,14 +546,19 @@ export async function synthesizeEdgeDirect(
   userPitch = 1.0,
   userRate = 1.0,
   userVolume = 1.0,
-  timeoutMs = 6500
+  timeoutMs = 7500
 ): Promise<Buffer> {
   const currentTask = edgeTtsChain.then(async () => {
+    const startedAt = Date.now();
     try {
       return await synthesizeEdgeDirectRaw(chunkText, voice, userPitch, userRate, userVolume, timeoutMs);
-    } catch {
-      await new Promise((r) => setTimeout(r, 150));
-      return await synthesizeEdgeDirectRaw(chunkText, voice, userPitch, userRate, userVolume, timeoutMs);
+    } catch (firstErr) {
+      // Only do a fast inline retry if the first attempt failed quickly (< 3s)
+      if (Date.now() - startedAt < 3000) {
+        await new Promise((r) => setTimeout(r, 150));
+        return await synthesizeEdgeDirectRaw(chunkText, voice, userPitch, userRate, userVolume, timeoutMs);
+      }
+      throw firstErr;
     }
   });
 
@@ -575,15 +585,15 @@ export async function synthesizeEdgeSpeechPayload(params: {
     strict = false,
   } = params;
 
-  const cleanText = text.trim();
-  const cacheKey = `edge_${strict ? 'strict_' : ''}${voice}_${rate}_${pitch}_${volume}_${cleanText}`;
+  const cleanText = sanitizeTextForTts(text);
+  const cacheKey = `edge_v2_${strict ? 'strict_' : ''}${voice}_${rate}_${pitch}_${volume}_${cleanText}`;
   if (ttsAudioCache.has(cacheKey)) {
     return ttsAudioCache.get(cacheKey)!;
   }
 
-  const maxChunkChars = strict ? 550 : 1000;
-  const maxSentChars = strict ? 500 : 900;
-  const maxWordChunkChars = strict ? 450 : 800;
+  const maxChunkChars = strict ? 350 : 1000;
+  const maxSentChars = strict ? 320 : 900;
+  const maxWordChunkChars = strict ? 300 : 800;
 
   const chunks: string[] = [];
   if (cleanText.length <= maxChunkChars) {
@@ -619,25 +629,18 @@ export async function synthesizeEdgeSpeechPayload(params: {
 
   const audioBuffers: Buffer[] = [];
   let usedGoogleFallback = false;
-  const edgeTimeoutMs = strict ? 9000 : 6500;
+  const edgeTimeoutMs = strict ? 7500 : 6500;
 
   for (const chunk of chunks) {
-    if (!chunk.trim()) continue;
+    const trimmedChunk = chunk.trim();
+    if (!trimmedChunk || !/[\p{L}\p{N}]/u.test(trimmedChunk)) continue;
     let edgeBuffer: Buffer | null = null;
     let lastEdgeError: unknown = null;
 
     try {
-      edgeBuffer = await synthesizeEdgeDirect(chunk, voice, pitch, rate, volume, edgeTimeoutMs);
+      edgeBuffer = await synthesizeEdgeDirect(trimmedChunk, voice, pitch, rate, volume, edgeTimeoutMs);
     } catch (err) {
       lastEdgeError = err;
-      if (strict) {
-        await new Promise((r) => setTimeout(r, 350));
-        try {
-          edgeBuffer = await synthesizeEdgeDirect(chunk, voice, pitch, rate, volume, edgeTimeoutMs);
-        } catch (retryErr) {
-          lastEdgeError = retryErr;
-        }
-      }
     }
 
     if (edgeBuffer && edgeBuffer.length > 0) {
@@ -647,12 +650,12 @@ export async function synthesizeEdgeSpeechPayload(params: {
 
     if (strict) {
       const reason = lastEdgeError instanceof Error ? lastEdgeError.message : 'Timeout/WebSocket closed';
-      throw new Error(`Không thể kết nối giọng Microsoft Edge (${reason}). Đã dừng để tránh lẫn giọng khác.`);
+      throw new Error(`Không thể kết nối trọn vẹn giọng Microsoft Edge (${reason}). Đã dừng để tránh bỏ sót câu hoặc lẫn giọng khác.`);
     }
 
     // Fallback to Google Translate TTS (live reading mode only)
     try {
-      const fb = await fetchGoogleTranslateAudio(chunk);
+      const fb = await fetchGoogleTranslateAudio(trimmedChunk);
       if (fb && fb.length > 0) {
         audioBuffers.push(fb);
         usedGoogleFallback = true;
@@ -662,7 +665,7 @@ export async function synthesizeEdgeSpeechPayload(params: {
 
   if (audioBuffers.length === 0) {
     if (strict) {
-      throw new Error('Không nhận được dữ liệu âm thanh từ giọng Microsoft Edge đã chọn.');
+      throw new Error('Không nhận được dữ liệu âm thanh trọn vẹn từ giọng Microsoft Edge đã chọn.');
     }
     const fb = await fetchGoogleTranslateAudio(cleanText);
     audioBuffers.push(fb);
