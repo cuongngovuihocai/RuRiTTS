@@ -424,7 +424,7 @@ async function synthesizeEdgeDirectRaw(
   userPitch = 1.0,
   userRate = 1.0,
   userVolume = 1.0,
-  timeoutMs = 7500
+  timeoutMs = 8500
 ): Promise<Buffer> {
   const profile = EDGE_VOICE_PROFILES[voice] || EDGE_VOICE_PROFILES['vi-VN-HoaiMyNeural'];
   const chosenBaseVoice = profile.baseVoice;
@@ -546,16 +546,16 @@ export async function synthesizeEdgeDirect(
   userPitch = 1.0,
   userRate = 1.0,
   userVolume = 1.0,
-  timeoutMs = 7500
+  timeoutMs = 8500
 ): Promise<Buffer> {
   const currentTask = edgeTtsChain.then(async () => {
     const startedAt = Date.now();
     try {
       return await synthesizeEdgeDirectRaw(chunkText, voice, userPitch, userRate, userVolume, timeoutMs);
     } catch (firstErr) {
-      // Only do a fast inline retry if the first attempt failed quickly (< 3s)
-      if (Date.now() - startedAt < 3000) {
-        await new Promise((r) => setTimeout(r, 150));
+      // Only do a fast inline retry if the first attempt failed quickly (< 2.2s)
+      if (Date.now() - startedAt < 2200) {
+        await new Promise((r) => setTimeout(r, 250));
         return await synthesizeEdgeDirectRaw(chunkText, voice, userPitch, userRate, userVolume, timeoutMs);
       }
       throw firstErr;
@@ -591,9 +591,9 @@ export async function synthesizeEdgeSpeechPayload(params: {
     return ttsAudioCache.get(cacheKey)!;
   }
 
-  const maxChunkChars = strict ? 350 : 1000;
-  const maxSentChars = strict ? 320 : 900;
-  const maxWordChunkChars = strict ? 300 : 800;
+  const maxChunkChars = strict ? 420 : 1000;
+  const maxSentChars = strict ? 380 : 900;
+  const maxWordChunkChars = strict ? 350 : 800;
 
   const chunks: string[] = [];
   if (cleanText.length <= maxChunkChars) {
@@ -629,7 +629,7 @@ export async function synthesizeEdgeSpeechPayload(params: {
 
   const audioBuffers: Buffer[] = [];
   let usedGoogleFallback = false;
-  const edgeTimeoutMs = strict ? 7500 : 6500;
+  const edgeTimeoutMs = strict ? 8500 : 7500;
 
   for (const chunk of chunks) {
     const trimmedChunk = chunk.trim();

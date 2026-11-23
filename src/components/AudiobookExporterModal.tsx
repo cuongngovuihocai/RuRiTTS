@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import JSZip from 'jszip';
 import {
   X,
@@ -14,6 +14,9 @@ import {
   ListChecks,
   CheckSquare,
   Square,
+  Pause,
+  RotateCcw,
+  RefreshCw,
 } from 'lucide-react';
 import { Book, VietnameseVoice, VoiceSettings, ThemeMode } from '../types';
 import {
@@ -29,6 +32,14 @@ import {
   generateGoogleTranslateSpeech,
   hasBackendSupport,
 } from '../services/geminiService';
+import {
+  clearExportJob,
+  computeExportTextHash,
+  getExportJobSavedIndices,
+  getExportJobSegments,
+  pruneOldExportJobs,
+  saveExportJobSegment,
+} from '../services/exportQueueDb';
 import { getThemeConfig } from '../utils/themeStyles';
 
 interface AudiobookExporterModalProps {
@@ -114,6 +125,34 @@ function splitTextForTtsExport(rawText: string, maxChars = 450): string[] {
   return filterSpeakable(chunks);
 }
 
+interface PlannedSegment {
+  globalIndex: number;
+  chapterIndex: number;
+  chapterTitle: string;
+  text: string;
+}
+
+interface PlannedChapter {
+  actualIndex: number;
+  title: string;
+  trackName: string;
+  segmentIndices: number[];
+}
+
+interface ExportPlan {
+  jobId: string;
+  chaptersPlan: PlannedChapter[];
+  segments: PlannedSegment[];
+  isMultiScope: boolean;
+  activeDelivery: 'zip' | 'separate';
+  fileExt: 'mp3' | 'wav';
+  safeTitle: string;
+}
+
+const sanitizeFileNameSafe = (name: string) => {
+  return name.replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, '_').trim();
+};
+
 export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
   isOpen,
   onClose,
@@ -154,6 +193,8 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
   );
   const [exportFormat, setExportFormat] = useState<'mp3' | 'wav'>('mp3');
   const [isExporting, setIsExporting] = useState(false);
+  const [savedCheckpointCount, setSavedCheckpointCount] = useState(0);
+  const cancelRequestedRef = useRef(false);
   const [progress, setProgress] = useState<{
     status: string;
     currentChapter: number;
@@ -163,7 +204,7 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
     fileName: string;
     separateFiles: { fileName: string; url: string; title: string; isPartial?: boolean }[];
   }>({
-    status: 'idle', // 'idle' | 'generating' | 'zipping' | 'completed' | 'error'
+    status: 'idle', // 'idle' | 'generating' | 'zipping' | 'completed' | 'paused' | 'error'
     currentChapter: 0,
     totalChapters: 0,
     message: '',
@@ -188,15 +229,178 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
     setRangeTo(String(Math.min(5, Math.max(1, book.chapters.length))));
   }, [book.id, book.chapters.length, isOpen]);
 
-  if (!isOpen) return null;
-
   const currentChapter = book.chapters[book.currentChapterIndex] || book.chapters[0];
 
-  const synthesizeChunkStrict = async (
+  // Deterministic segment plan (like IDM file-part map) so completed segments resume cleanly
+  const exportPlan = useMemo<ExportPlan>(() => {
+    const fileExt: 'mp3' | 'wav' = exportFormat === 'mp3' ? 'mp3' : 'wav';
+    const safeTitle = sanitizeFileNameSafe(book.title || 'AudioBook');
+    const maxChunkLen = voiceSettings.engine === 'edge' ? 380 : 450;
+    const isMultiScope = exportScope === 'zip_chapters' || exportScope === 'selected_chapters';
+    const activeDelivery: 'zip' | 'separate' =
+      exportScope === 'selected_chapters' ? selectedDeliveryMode : 'zip';
+
+    const segments: PlannedSegment[] = [];
+    const chaptersPlan: PlannedChapter[] = [];
+    let scopeKey = exportScope;
+
+    if (exportScope === 'single_full') {
+      const fullText = book.chapters
+        .map((c) => c.sentences.map((s) => s.text).join(' '))
+        .join('\n\n');
+      const chunks = splitTextForTtsExport(fullText, maxChunkLen);
+      const segIndices: number[] = [];
+      for (const chunkText of chunks) {
+        const globalIndex = segments.length;
+        segments.push({
+          globalIndex,
+          chapterIndex: 0,
+          chapterTitle: book.title || 'Toàn bộ sách',
+          text: chunkText,
+        });
+        segIndices.push(globalIndex);
+      }
+      chaptersPlan.push({
+        actualIndex: 0,
+        title: book.title || 'AudioBook',
+        trackName: `${safeTitle}.${fileExt}`,
+        segmentIndices: segIndices,
+      });
+    } else if (exportScope === 'current') {
+      const chap = currentChapter;
+      const chapText = chap ? chap.sentences.map((s) => s.text).join(' ') : '';
+      const chunks = splitTextForTtsExport(chapText, maxChunkLen);
+      const segIndices: number[] = [];
+      for (const chunkText of chunks) {
+        const globalIndex = segments.length;
+        segments.push({
+          globalIndex,
+          chapterIndex: book.currentChapterIndex || 0,
+          chapterTitle: chap?.title || 'Chương hiện tại',
+          text: chunkText,
+        });
+        segIndices.push(globalIndex);
+      }
+      scopeKey = `current_${chap?.id || book.currentChapterIndex}`;
+      chaptersPlan.push({
+        actualIndex: book.currentChapterIndex || 0,
+        title: chap?.title || 'Chương hiện tại',
+        trackName: `${safeTitle}_${sanitizeFileNameSafe(chap?.title || 'Chuong')}.${fileExt}`,
+        segmentIndices: segIndices,
+      });
+    } else {
+      const targetIndices =
+        exportScope === 'zip_chapters'
+          ? book.chapters.map((_, idx) => idx)
+          : [...selectedChapterIndices].sort((a, b) => a - b);
+      scopeKey = `${exportScope}_${targetIndices.join(',')}`;
+      const padDigits = Math.max(2, String(book.chapters.length).length);
+
+      for (const actualIdx of targetIndices) {
+        const chap = book.chapters[actualIdx];
+        if (!chap) continue;
+        const chapText = chap.sentences.map((s) => s.text).join(' ');
+        const chunks = splitTextForTtsExport(chapText, maxChunkLen);
+        if (chunks.length === 0) continue;
+
+        const segIndices: number[] = [];
+        for (const chunkText of chunks) {
+          const globalIndex = segments.length;
+          segments.push({
+            globalIndex,
+            chapterIndex: actualIdx,
+            chapterTitle: chap.title,
+            text: chunkText,
+          });
+          segIndices.push(globalIndex);
+        }
+
+        const paddedIndex = String(actualIdx + 1).padStart(padDigits, '0');
+        chaptersPlan.push({
+          actualIndex: actualIdx,
+          title: chap.title,
+          trackName: `${paddedIndex}_${sanitizeFileNameSafe(chap.title)}.${fileExt}`,
+          segmentIndices: segIndices,
+        });
+      }
+    }
+
+    const textHash = computeExportTextHash(segments.map((s) => s.text).join('\n'));
+    const voiceSignature = `${voiceSettings.engine}_${voiceSettings.voiceId}_${voiceSettings.rate}_${voiceSettings.pitch}_${voiceSettings.volume}_${voiceSettings.emotion}`;
+    const jobId = `exp_${book.id}_${scopeKey}_${voiceSignature}_${textHash}`;
+
+    return {
+      jobId,
+      chaptersPlan,
+      segments,
+      isMultiScope,
+      activeDelivery,
+      fileExt,
+      safeTitle,
+    };
+  }, [
+    book.id,
+    book.title,
+    book.chapters,
+    book.currentChapterIndex,
+    currentChapter,
+    exportScope,
+    exportFormat,
+    selectedChapterIndices,
+    selectedDeliveryMode,
+    voiceSettings.engine,
+    voiceSettings.voiceId,
+    voiceSettings.rate,
+    voiceSettings.pitch,
+    voiceSettings.volume,
+    voiceSettings.emotion,
+  ]);
+
+  // Scan IndexedDB for saved checkpoints whenever modal opens or settings change
+  useEffect(() => {
+    if (!isOpen || isExporting) return;
+    let active = true;
+    pruneOldExportJobs().catch(() => {});
+    if (exportPlan.segments.length === 0) {
+      setSavedCheckpointCount(0);
+      return;
+    }
+    getExportJobSavedIndices(exportPlan.jobId)
+      .then((savedSet) => {
+        if (!active) return;
+        let count = 0;
+        for (const seg of exportPlan.segments) {
+          if (savedSet.has(seg.globalIndex)) count++;
+        }
+        setSavedCheckpointCount(count);
+      })
+      .catch(() => {
+        if (active) setSavedCheckpointCount(0);
+      });
+    return () => {
+      active = false;
+    };
+  }, [isOpen, isExporting, exportPlan.jobId, exportPlan.segments.length]);
+
+  if (!isOpen) return null;
+
+  const sleepInterruptible = async (ms: number) => {
+    const step = 200;
+    let elapsed = 0;
+    while (elapsed < ms) {
+      if (cancelRequestedRef.current) return;
+      await new Promise((r) => setTimeout(r, Math.min(step, ms - elapsed)));
+      elapsed += step;
+    }
+  };
+
+  const synthesizeSegmentStrict = async (
     chunkText: string,
     effectiveRate: number,
     effectivePitch: number,
-    effectiveVolume: number
+    effectiveVolume: number,
+    maxAttempts = 2,
+    retryDelayMs = 900
   ): Promise<string> => {
     if (voiceSettings.engine === 'native') {
       throw new Error(
@@ -205,10 +409,11 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
     }
 
     if (voiceSettings.engine === 'edge') {
-      const retryDelays = [600, 1400, 2400, 3600];
       let lastError: any = null;
-
-      for (let attempt = 0; attempt < 4; attempt++) {
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        if (cancelRequestedRef.current) {
+          throw new Error('EXPORT_PAUSED');
+        }
         try {
           const res = await generateEdgeSpeech(
             chunkText,
@@ -224,21 +429,23 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
           throw new Error('Âm thanh trả về bị rỗng, thiếu đoạn hoặc chuyển sang giọng dự phòng.');
         } catch (err: any) {
           lastError = err;
-          if (attempt < 3) {
-            await new Promise((r) => setTimeout(r, retryDelays[attempt]));
+          if (attempt < maxAttempts - 1 && !cancelRequestedRef.current) {
+            await sleepInterruptible(retryDelayMs * (attempt + 1));
           }
         }
       }
 
       throw new Error(
-        `Không thể nhận trọn vẹn giọng Microsoft Edge "${selectedVoiceName}" sau 4 lần thử (${lastError?.message || 'Lỗi mạng'}). Đã dừng để đảm bảo không bị nhảy cóc câu hoặc lẫn giọng khác.`
+        lastError?.message || `Không thể nhận trọn vẹn giọng Microsoft Edge "${selectedVoiceName}".`
       );
     }
 
     // Strict Google Translate TTS
-    const gtDelays = [500, 1100, 1800];
     let lastGtError: any = null;
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      if (cancelRequestedRef.current) {
+        throw new Error('EXPORT_PAUSED');
+      }
       try {
         const res = await generateGoogleTranslateSpeech(chunkText, voiceSettings.voiceId, { strict: true });
         if (res?.audioBase64 && res.audioBase64.length >= 64 && !res.isFallback) {
@@ -247,14 +454,14 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
         throw new Error('Phản hồi Google TTS không hợp lệ hoặc bị rỗng.');
       } catch (err: any) {
         lastGtError = err;
-        if (attempt < 2) {
-          await new Promise((r) => setTimeout(r, gtDelays[attempt]));
+        if (attempt < maxAttempts - 1 && !cancelRequestedRef.current) {
+          await sleepInterruptible(600 * (attempt + 1));
         }
       }
     }
 
     throw new Error(
-      `Không thể kết nối giọng Google TTS "${selectedVoiceName}" sau 3 lần thử (${lastGtError?.message || 'Lỗi mạng'}). Đã dừng để đảm bảo file Audiobook không bị lẫn giọng khác.`
+      lastGtError?.message || `Không thể kết nối giọng Google TTS "${selectedVoiceName}".`
     );
   };
 
@@ -270,65 +477,6 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
       buffers.push(await decodeAudioBase64(b64));
     }
     return concatAudioBuffersToWavBlob(buffers);
-  };
-
-  // Synthesize text to MP3 or WAV Blob in small sequential chunks locked strictly to 1 voice
-  const synthesizeTextToAudio = async (
-    text: string,
-    format: 'mp3' | 'wav',
-    onChunkProgress?: (done: number, total: number) => void
-  ): Promise<Blob> => {
-    const emotionAcoustics = getEmotionAcoustics(voiceSettings.emotion);
-    const effectiveRate = Math.max(0.5, Math.min(3.0, voiceSettings.rate * emotionAcoustics.rateMultiplier));
-    const effectivePitch = Math.max(0.5, Math.min(1.5, voiceSettings.pitch * emotionAcoustics.pitchMultiplier));
-    const effectiveVolume = Math.max(0, Math.min(1.0, voiceSettings.volume * emotionAcoustics.volumeMultiplier));
-
-    if (voiceSettings.engine === 'native') {
-      throw new Error(
-        'Giọng đọc thiết bị (Offline) không hỗ trợ xuất thành file Audio. Hãy chuyển sang giọng Microsoft Edge hoặc Google TTS trong "Giọng đọc & Giao diện".'
-      );
-    }
-
-    if (!backendReady) {
-      throw new Error('Không thể kết nối máy chủ xử lý giọng đọc trực tuyến.');
-    }
-
-    if (isOffline) {
-      throw new Error('Thiết bị đang ngoại tuyến (Offline). Vui lòng kết nối Internet để xuất file Audio MP3/WAV.');
-    }
-
-    // Use compact 280-char chunks for Edge TTS so each WebSocket turn completes rapidly without dropping sentences
-    const maxChunkLen = voiceSettings.engine === 'edge' ? 280 : 450;
-    const chunks = splitTextForTtsExport(text, maxChunkLen);
-    if (chunks.length === 0) {
-      throw new Error('Nội dung văn bản trống, không thể tạo file âm thanh.');
-    }
-
-    const base64Chunks: string[] = [];
-    const interChunkPauseMs = voiceSettings.engine === 'edge' ? 120 : 30;
-
-    for (let i = 0; i < chunks.length; i++) {
-      onChunkProgress?.(i, chunks.length);
-      const b64 = await synthesizeChunkStrict(
-        chunks[i],
-        effectiveRate,
-        effectivePitch,
-        effectiveVolume
-      );
-      base64Chunks.push(b64);
-      onChunkProgress?.(i + 1, chunks.length);
-
-      // Gentle throttle pause between chunks so Bing Edge WebSocket doesn't rate-limit long exports
-      if (i < chunks.length - 1 && interChunkPauseMs > 0) {
-        await new Promise((r) => setTimeout(r, interChunkPauseMs));
-      }
-    }
-
-    return buildAudioBlobFromBase64Chunks(base64Chunks, format);
-  };
-
-  const sanitizeFileName = (name: string) => {
-    return name.replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, '_').trim();
   };
 
   const triggerAutoDownload = (url: string, fileName: string) => {
@@ -371,7 +519,33 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
     setRangeTo(String(endNum));
   };
 
-  const handleStartExport = async () => {
+  const handlePauseExport = () => {
+    cancelRequestedRef.current = true;
+    setProgress((prev) => ({
+      ...prev,
+      message: 'Đang tạm dừng và lưu tiến trình các đoạn đã xong...',
+    }));
+  };
+
+  const handleClearCheckpoints = async () => {
+    if (isExporting) return;
+    await clearExportJob(exportPlan.jobId);
+    setSavedCheckpointCount(0);
+    setProgress((prev) => ({
+      ...prev,
+      status: 'idle',
+      message: '',
+    }));
+  };
+
+  const handleCloseModal = () => {
+    if (isExporting) {
+      cancelRequestedRef.current = true;
+    }
+    onClose();
+  };
+
+  const handleStartExport = async (resetFirst = false) => {
     if (progress.downloadUrl) {
       try {
         URL.revokeObjectURL(progress.downloadUrl);
@@ -383,324 +557,448 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
       } catch {}
     }
 
+    cancelRequestedRef.current = false;
     setIsExporting(true);
     if (voiceSettings.enableSoundCues) playSoundCue('click');
 
-    const fileExt = exportFormat === 'mp3' ? 'mp3' : 'wav';
-    const safeTitle = sanitizeFileName(book.title || 'AudioBook');
+    const { jobId, chaptersPlan, segments, isMultiScope, activeDelivery, fileExt, safeTitle } = exportPlan;
+    const totalSegments = segments.length;
 
     setProgress({
       status: 'generating',
       currentChapter: 0,
-      totalChapters: 1,
-      message: `Đang khởi tạo âm thanh .${fileExt.toUpperCase()}...`,
+      totalChapters: Math.max(1, totalSegments),
+      message: `Đang khởi tạo hàng đợi tải thông minh (${totalSegments} đoạn)...`,
       downloadUrl: '',
       fileName: '',
       separateFiles: [],
     });
 
-    // Track only 100% completed, error-free files (broken/incomplete files are discarded)
-    const completedZipTracks: { index: number; title: string; trackName: string; blob: Blob }[] = [];
-    const isMultiScope = exportScope === 'zip_chapters' || exportScope === 'selected_chapters';
-    const activeTargetIndices =
-      exportScope === 'zip_chapters'
-        ? book.chapters.map((_, idx) => idx)
-        : exportScope === 'selected_chapters'
-        ? [...selectedChapterIndices].sort((a, b) => a - b)
-        : [];
-    const activeDelivery: 'zip' | 'separate' =
-      exportScope === 'selected_chapters' ? selectedDeliveryMode : 'zip';
-
     try {
-      if (exportScope === 'single_full') {
-        const fullText = book.chapters
-          .map((c) => c.sentences.map((s) => s.text).join(' '))
-          .join('\n\n');
-
-        const audioBlob = await synthesizeTextToAudio(
-          fullText,
-          exportFormat,
-          (done, total) => {
-            setProgress({
-              status: 'generating',
-              currentChapter: done,
-              totalChapters: total,
-              message: `Đang kết xuất đoạn ${done}/${total} thành file .${fileExt.toUpperCase()}...`,
-              downloadUrl: '',
-              fileName: '',
-              separateFiles: [],
-            });
-          }
+      if (voiceSettings.engine === 'native') {
+        throw new Error(
+          'Giọng đọc thiết bị (Offline) không hỗ trợ xuất thành file Audio. Hãy chuyển sang giọng Microsoft Edge hoặc Google TTS trong "Giọng đọc & Giao diện".'
         );
+      }
+      if (!backendReady) {
+        throw new Error('Không thể kết nối máy chủ xử lý giọng đọc trực tuyến.');
+      }
+      if (isOffline) {
+        throw new Error('Thiết bị đang ngoại tuyến (Offline). Vui lòng kết nối Internet để xuất file Audio MP3/WAV.');
+      }
+      if (isMultiScope && chaptersPlan.length === 0) {
+        throw new Error('Vui lòng chọn ít nhất 1 chương có nội dung chữ để xuất file audio.');
+      }
+      if (totalSegments === 0) {
+        throw new Error('Nội dung văn bản trống, không thể tạo file âm thanh.');
+      }
 
-        const url = URL.createObjectURL(audioBlob);
-        const fileName = `${safeTitle}.${fileExt}`;
+      const emotionAcoustics = getEmotionAcoustics(voiceSettings.emotion);
+      const effectiveRate = Math.max(0.5, Math.min(3.0, voiceSettings.rate * emotionAcoustics.rateMultiplier));
+      const effectivePitch = Math.max(0.5, Math.min(1.5, voiceSettings.pitch * emotionAcoustics.pitchMultiplier));
+      const effectiveVolume = Math.max(0, Math.min(1.0, voiceSettings.volume * emotionAcoustics.volumeMultiplier));
 
-        setProgress({
-          status: 'completed',
-          currentChapter: 1,
-          totalChapters: 1,
-          message: `Đã tạo xong file âm thanh "${fileName}"! Đang tự động tải về...`,
-          downloadUrl: url,
-          fileName,
-          separateFiles: [],
-        });
+      if (resetFirst) {
+        await clearExportJob(jobId);
+        setSavedCheckpointCount(0);
+      }
 
-        triggerAutoDownload(url, fileName);
-        if (voiceSettings.enableSoundCues) playSoundCue('success');
-      } else if (exportScope === 'current') {
-        const chapter = currentChapter;
-        const safeChapterTitle = sanitizeFileName(chapter.title);
-        const textContent = chapter.sentences.map((s) => s.text).join(' ');
-
-        const audioBlob = await synthesizeTextToAudio(
-          textContent,
-          exportFormat,
-          (done, total) => {
-            setProgress({
-              status: 'generating',
-              currentChapter: done,
-              totalChapters: total,
-              message: `Đang tạo đoạn ${done}/${total} chương "${chapter.title}"...`,
-              downloadUrl: '',
-              fileName: '',
-              separateFiles: [],
-            });
-          }
-        );
-
-        const url = URL.createObjectURL(audioBlob);
-        const fileName = `${safeTitle}_${safeChapterTitle}.${fileExt}`;
-
-        setProgress({
-          status: 'completed',
-          currentChapter: 1,
-          totalChapters: 1,
-          message: `Đã hoàn thành xuất file .${fileExt.toUpperCase()} chương "${chapter.title}"! Đang tải về...`,
-          downloadUrl: url,
-          fileName,
-          separateFiles: [],
-        });
-
-        triggerAutoDownload(url, fileName);
-        if (voiceSettings.enableSoundCues) playSoundCue('success');
-      } else {
-        // 3. Export multiple selected chapters (or all chapters):
-        // - Google TTS: parallel batching (3 chapters/batch) for fast speed
-        // - Microsoft Edge TTS: sequential chapter processing to prevent Bing WebSocket throttling
-        if (activeTargetIndices.length === 0) {
-          throw new Error('Vui lòng chọn ít nhất 1 chương để xuất file audio.');
+      // 1. Load existing IDM-style segment checkpoints from IndexedDB
+      const segmentMap = await getExportJobSegments(jobId);
+      const countCompleted = () => {
+        let count = 0;
+        for (const s of segments) {
+          if (segmentMap.has(s.globalIndex)) count++;
         }
+        return count;
+      };
 
-        const total = activeTargetIndices.length;
-        const padDigits = Math.max(2, String(book.chapters.length).length);
+      const initialDone = countCompleted();
+      if (initialDone > 0) {
+        setProgress({
+          status: 'generating',
+          currentChapter: initialDone,
+          totalChapters: totalSegments,
+          message: `Đã khôi phục ${initialDone}/${totalSegments} đoạn từ bộ nhớ tạm, đang tải tiếp phần còn thiếu...`,
+          downloadUrl: '',
+          fileName: '',
+          separateFiles: [],
+        });
+      }
 
-        if (voiceSettings.engine === 'google-translate') {
-          const BATCH_SIZE = 3;
-          let completedCount = 0;
+      let lastErrorMessage = '';
 
-          for (let i = 0; i < total; i += BATCH_SIZE) {
-            const batchIndices = activeTargetIndices.slice(i, i + BATCH_SIZE);
-            const batchResults = await Promise.allSettled(
-              batchIndices.map(async (actualIdx) => {
-                const chap = book.chapters[actualIdx];
-                if (!chap) return;
-                const textContent = chap.sentences.map((s) => s.text).join(' ');
-                const audioBlob = await synthesizeTextToAudio(textContent, exportFormat);
-                const paddedIndex = String(actualIdx + 1).padStart(padDigits, '0');
-                const trackName = `${paddedIndex}_${sanitizeFileName(chap.title)}.${fileExt}`;
-                completedZipTracks.push({ index: actualIdx, title: chap.title, trackName, blob: audioBlob });
+      // 2. Pass 1 — Download all pending segments without aborting the whole queue on single errors
+      const pass1Pending = segments.filter((s) => !segmentMap.has(s.globalIndex));
 
-                completedCount++;
-                setProgress({
-                  status: 'generating',
-                  currentChapter: completedCount,
-                  totalChapters: total,
-                  message: `Đang xử lý song song: đã xong ${completedCount}/${total} chương...`,
-                  downloadUrl: '',
-                  fileName: '',
-                  separateFiles: [],
-                });
-              })
-            );
-
-            const rejected = batchResults.find((r) => r.status === 'rejected') as PromiseRejectedResult | undefined;
-            if (rejected) {
-              throw rejected.reason;
-            }
-          }
-        } else {
-          for (let pos = 0; pos < total; pos++) {
-            const actualIdx = activeTargetIndices[pos];
-            const chap = book.chapters[actualIdx];
-            if (!chap) continue;
-            const textContent = chap.sentences.map((s) => s.text).join(' ');
-
-            setProgress({
-              status: 'generating',
-              currentChapter: pos,
-              totalChapters: total,
-              message: `Đang xử lý ${pos + 1}/${total}: "${chap.title}"...`,
-              downloadUrl: '',
-              fileName: '',
-              separateFiles: [],
-            });
-
-            const audioBlob = await synthesizeTextToAudio(
-              textContent,
-              exportFormat,
-              (done, chunkTotal) => {
-                setProgress({
-                  status: 'generating',
-                  currentChapter: pos,
-                  totalChapters: total,
-                  message: `Đang xử lý ${pos + 1}/${total} ("${chap.title}"): đoạn ${done}/${chunkTotal}...`,
-                  downloadUrl: '',
-                  fileName: '',
-                  separateFiles: [],
-                });
+      if (voiceSettings.engine === 'google-translate') {
+        const CONCURRENCY = 3;
+        for (let i = 0; i < pass1Pending.length; i += CONCURRENCY) {
+          if (cancelRequestedRef.current) break;
+          const batch = pass1Pending.slice(i, i + CONCURRENCY);
+          await Promise.allSettled(
+            batch.map(async (seg) => {
+              try {
+                const b64 = await synthesizeSegmentStrict(
+                  seg.text,
+                  effectiveRate,
+                  effectivePitch,
+                  effectiveVolume,
+                  2,
+                  500
+                );
+                segmentMap.set(seg.globalIndex, b64);
+                await saveExportJobSegment(jobId, seg.globalIndex, b64);
+              } catch (err: any) {
+                if (err?.message !== 'EXPORT_PAUSED') {
+                  lastErrorMessage = err?.message || lastErrorMessage;
+                }
               }
-            );
+            })
+          );
 
-            const paddedIndex = String(actualIdx + 1).padStart(padDigits, '0');
-            const trackName = `${paddedIndex}_${sanitizeFileName(chap.title)}.${fileExt}`;
-            completedZipTracks.push({ index: actualIdx, title: chap.title, trackName, blob: audioBlob });
-
-            setProgress({
-              status: 'generating',
-              currentChapter: pos + 1,
-              totalChapters: total,
-              message: `Đã xong ${pos + 1}/${total}: "${chap.title}"`,
-              downloadUrl: '',
-              fileName: '',
-              separateFiles: [],
-            });
-
-            if (pos < total - 1) {
-              await new Promise((r) => setTimeout(r, 200));
-            }
-          }
-        }
-
-        completedZipTracks.sort((a, b) => a.index - b.index);
-
-        if (activeDelivery === 'separate') {
-          const separateFiles = completedZipTracks.map((t) => ({
-            fileName: t.trackName,
-            url: URL.createObjectURL(t.blob),
-            title: t.title,
-          }));
-
+          const doneNow = countCompleted();
+          setSavedCheckpointCount(doneNow);
           setProgress({
-            status: 'completed',
-            currentChapter: total,
-            totalChapters: total,
-            message: `Đã tạo xong ${separateFiles.length} file .${fileExt.toUpperCase()} riêng lẻ! Đang kích hoạt tải xuống...`,
+            status: 'generating',
+            currentChapter: doneNow,
+            totalChapters: totalSegments,
+            message: `Đang tải song song: đã xong ${doneNow}/${totalSegments} đoạn (${batch[0].chapterTitle})...`,
             downloadUrl: '',
             fileName: '',
-            separateFiles,
-          });
-
-          // Trigger staggered auto-downloads; user can also tap any file directly in the list below if browser blocks multi-download
-          separateFiles.forEach((file, idx) => {
-            setTimeout(() => {
-              triggerAutoDownload(file.url, file.fileName);
-            }, idx * 350);
-          });
-          if (voiceSettings.enableSoundCues) playSoundCue('success');
-        } else {
-          const zip = new JSZip();
-          for (const track of completedZipTracks) {
-            zip.file(track.trackName, track.blob);
-          }
-
-          // Add lightweight JSON metadata (NO heavy/redundant txt transcript)
-          const metadata = {
-            title: book.title,
-            author: book.author || 'Tác giả',
-            totalChapters: completedZipTracks.length,
-            totalBookChapters: book.chapters.length,
-            totalWords: book.wordCount,
-            audioFormat: fileExt.toUpperCase(),
-            voiceEngine: voiceSettings.engine,
-            voiceId: voiceSettings.voiceId,
-            voiceName: selectedVoiceName,
-            strictSingleVoice: true,
-            exportedAt: new Date().toISOString(),
-            chapters: completedZipTracks.map((t) => ({
-              track: t.index + 1,
-              fileName: t.trackName,
-              title: t.title,
-            })),
-          };
-          zip.file('thong_tin_audio.json', JSON.stringify(metadata, null, 2));
-
-          setProgress((prev) => ({
-            ...prev,
-            status: 'zipping',
-            message: 'Đang nén file âm thanh các chương...',
-          }));
-
-          const zipBlob = await zip.generateAsync({
-            type: 'blob',
-            compression: 'STORE', // Audio is already compressed, STORE is fast
-          });
-
-          const url = URL.createObjectURL(zipBlob);
-          const fileName =
-            exportScope === 'zip_chapters'
-              ? `${safeTitle}_Audio_TronBo_${fileExt.toUpperCase()}.zip`
-              : `${safeTitle}_Audio_DaChon_${completedZipTracks.length}chuong_${fileExt.toUpperCase()}.zip`;
-
-          setProgress({
-            status: 'completed',
-            currentChapter: total,
-            totalChapters: total,
-            message: `Đã nén xong ${completedZipTracks.length} file âm thanh! Đang tải về...`,
-            downloadUrl: url,
-            fileName,
             separateFiles: [],
           });
 
-          triggerAutoDownload(url, fileName);
-          if (voiceSettings.enableSoundCues) playSoundCue('success');
+          if (i + CONCURRENCY < pass1Pending.length && !cancelRequestedRef.current) {
+            await sleepInterruptible(40);
+          }
+        }
+      } else {
+        // Microsoft Edge: strictly sequential with gentle pacing + adaptive cooldown
+        let consecutiveErrors = 0;
+        for (let idx = 0; idx < pass1Pending.length; idx++) {
+          if (cancelRequestedRef.current) break;
+          const seg = pass1Pending[idx];
+
+          setProgress({
+            status: 'generating',
+            currentChapter: countCompleted(),
+            totalChapters: totalSegments,
+            message: `Đang tải đoạn ${seg.globalIndex + 1}/${totalSegments} (${seg.chapterTitle})...`,
+            downloadUrl: '',
+            fileName: '',
+            separateFiles: [],
+          });
+
+          try {
+            const b64 = await synthesizeSegmentStrict(
+              seg.text,
+              effectiveRate,
+              effectivePitch,
+              effectiveVolume,
+              2,
+              900
+            );
+            segmentMap.set(seg.globalIndex, b64);
+            await saveExportJobSegment(jobId, seg.globalIndex, b64);
+            consecutiveErrors = 0;
+
+            const doneNow = countCompleted();
+            setSavedCheckpointCount(doneNow);
+            setProgress({
+              status: 'generating',
+              currentChapter: doneNow,
+              totalChapters: totalSegments,
+              message: `Đã lưu an toàn ${doneNow}/${totalSegments} đoạn (${seg.chapterTitle})...`,
+              downloadUrl: '',
+              fileName: '',
+              separateFiles: [],
+            });
+
+            if (idx < pass1Pending.length - 1 && !cancelRequestedRef.current) {
+              await sleepInterruptible(320);
+            }
+          } catch (err: any) {
+            if (err?.message === 'EXPORT_PAUSED' || cancelRequestedRef.current) break;
+            lastErrorMessage = err?.message || 'Lỗi kết nối Edge TTS';
+            consecutiveErrors++;
+
+            if (typeof navigator !== 'undefined' && !navigator.onLine) {
+              lastErrorMessage = 'Thiết bị mất kết nối Internet.';
+              break;
+            }
+
+            // Adaptive cooldown so Bing rate-limiting recovers, while moving on instead of losing progress
+            const cooldownMs = Math.min(10000, 2000 * consecutiveErrors);
+            setProgress({
+              status: 'generating',
+              currentChapter: countCompleted(),
+              totalChapters: totalSegments,
+              message: `Đoạn ${seg.globalIndex + 1} tạm nghẽn, chuyển qua tải bù sau (tạm nghỉ ${Math.round(cooldownMs / 1000)}s)...`,
+              downloadUrl: '',
+              fileName: '',
+              separateFiles: [],
+            });
+            await sleepInterruptible(cooldownMs);
+          }
         }
       }
 
-      if (voiceSettings.enableSpokenGuide) {
-        speakAnnouncement('Đã xuất xong file âm thanh và bắt đầu tải về.', voiceSettings);
-      }
-    } catch (err: any) {
-      console.error('Export error:', err);
-      let partialUrl = '';
-      let partialFileName = '';
-      let partialNote = '';
-      const cleanSeparateFiles: { fileName: string; url: string; title: string; isPartial?: boolean }[] = [];
+      // 3. Self-Healing Auto-Repair Rounds (IDM-style: retry ONLY missing segments!)
+      const MAX_REPAIR_ROUNDS = 3;
+      let missingSegments = segments.filter((s) => !segmentMap.has(s.globalIndex));
 
-      try {
-        if (isMultiScope && completedZipTracks.length > 0) {
-          const expectedCount = activeTargetIndices.length || book.chapters.length;
-          completedZipTracks.sort((a, b) => a.index - b.index);
+      for (
+        let round = 1;
+        round <= MAX_REPAIR_ROUNDS && missingSegments.length > 0 && !cancelRequestedRef.current;
+        round++
+      ) {
+        if (typeof navigator !== 'undefined' && !navigator.onLine) break;
+
+        const roundCooldownMs = voiceSettings.engine === 'edge' ? round * 4000 : round * 1500;
+        const cooldownSec = Math.round(roundCooldownMs / 1000);
+        setProgress({
+          status: 'generating',
+          currentChapter: countCompleted(),
+          totalChapters: totalSegments,
+          message: `Vòng tự tải bù ${round}/${MAX_REPAIR_ROUNDS}: tạm nghỉ ${cooldownSec}s cho máy chủ ổn định (còn ${missingSegments.length} đoạn)...`,
+          downloadUrl: '',
+          fileName: '',
+          separateFiles: [],
+        });
+        await sleepInterruptible(roundCooldownMs);
+        if (cancelRequestedRef.current) break;
+
+        let consecutiveRepairErrors = 0;
+        for (let m = 0; m < missingSegments.length; m++) {
+          if (cancelRequestedRef.current) break;
+          if (typeof navigator !== 'undefined' && !navigator.onLine) break;
+          const seg = missingSegments[m];
+
+          setProgress({
+            status: 'generating',
+            currentChapter: countCompleted(),
+            totalChapters: totalSegments,
+            message: `Tải bù vòng ${round}/${MAX_REPAIR_ROUNDS}: đoạn ${seg.globalIndex + 1}/${totalSegments} (${m + 1}/${missingSegments.length} đoạn thiếu)...`,
+            downloadUrl: '',
+            fileName: '',
+            separateFiles: [],
+          });
+
+          try {
+            const b64 = await synthesizeSegmentStrict(
+              seg.text,
+              effectiveRate,
+              effectivePitch,
+              effectiveVolume,
+              2,
+              1400
+            );
+            segmentMap.set(seg.globalIndex, b64);
+            await saveExportJobSegment(jobId, seg.globalIndex, b64);
+            consecutiveRepairErrors = 0;
+            setSavedCheckpointCount(countCompleted());
+
+            if (m < missingSegments.length - 1 && !cancelRequestedRef.current) {
+              await sleepInterruptible(voiceSettings.engine === 'edge' ? 450 : 120);
+            }
+          } catch (err: any) {
+            if (err?.message === 'EXPORT_PAUSED' || cancelRequestedRef.current) break;
+            lastErrorMessage = err?.message || lastErrorMessage;
+            consecutiveRepairErrors++;
+            const errWait = Math.min(12000, 3000 * consecutiveRepairErrors);
+            await sleepInterruptible(errWait);
+          }
+        }
+
+        missingSegments = segments.filter((s) => !segmentMap.has(s.globalIndex));
+      }
+
+      // 4. Assembly Phase — ONLY assemble chapters/files that have 100% of their segments verified!
+      missingSegments = segments.filter((s) => !segmentMap.has(s.globalIndex));
+      const doneTotal = countCompleted();
+      setSavedCheckpointCount(doneTotal);
+
+      if (missingSegments.length === 0 && !cancelRequestedRef.current) {
+        // 100% COMPLETE!
+        setProgress((prev) => ({
+          ...prev,
+          status: 'zipping',
+          currentChapter: totalSegments,
+          totalChapters: totalSegments,
+          message: `Đủ 100% (${totalSegments}/${totalSegments} đoạn)! Đang ghép thành file .${fileExt.toUpperCase()}...`,
+        }));
+
+        if (!isMultiScope) {
+          const chapPlan = chaptersPlan[0];
+          const chunks = chapPlan.segmentIndices.map((idx) => segmentMap.get(idx)!);
+          const audioBlob = await buildAudioBlobFromBase64Chunks(chunks, exportFormat);
+          const url = URL.createObjectURL(audioBlob);
+
+          await clearExportJob(jobId);
+          setSavedCheckpointCount(0);
+
+          setProgress({
+            status: 'completed',
+            currentChapter: totalSegments,
+            totalChapters: totalSegments,
+            message: `Đã xuất hoàn chỉnh "${chapPlan.trackName}" (đủ ${totalSegments}/${totalSegments} đoạn, không bỏ sót câu)! Đang tải về...`,
+            downloadUrl: url,
+            fileName: chapPlan.trackName,
+            separateFiles: [],
+          });
+
+          triggerAutoDownload(url, chapPlan.trackName);
+          if (voiceSettings.enableSoundCues) playSoundCue('success');
+        } else {
+          const completedTracks: { actualIndex: number; title: string; trackName: string; blob: Blob }[] = [];
+          for (let cIdx = 0; cIdx < chaptersPlan.length; cIdx++) {
+            const chapPlan = chaptersPlan[cIdx];
+            setProgress((prev) => ({
+              ...prev,
+              status: 'zipping',
+              message: `Đang ghép âm thanh chương ${cIdx + 1}/${chaptersPlan.length}: "${chapPlan.title}"...`,
+            }));
+            const chunks = chapPlan.segmentIndices.map((idx) => segmentMap.get(idx)!);
+            const blob = await buildAudioBlobFromBase64Chunks(chunks, exportFormat);
+            completedTracks.push({
+              actualIndex: chapPlan.actualIndex,
+              title: chapPlan.title,
+              trackName: chapPlan.trackName,
+              blob,
+            });
+          }
+
+          await clearExportJob(jobId);
+          setSavedCheckpointCount(0);
 
           if (activeDelivery === 'separate') {
-            for (const track of completedZipTracks) {
+            const separateFiles = completedTracks.map((t) => ({
+              fileName: t.trackName,
+              url: URL.createObjectURL(t.blob),
+              title: t.title,
+            }));
+
+            setProgress({
+              status: 'completed',
+              currentChapter: totalSegments,
+              totalChapters: totalSegments,
+              message: `Đã tạo hoàn chỉnh ${separateFiles.length} file .${fileExt.toUpperCase()} (100% không sót câu)! Đang kích hoạt tải xuống...`,
+              downloadUrl: '',
+              fileName: '',
+              separateFiles,
+            });
+
+            separateFiles.forEach((file, idx) => {
+              setTimeout(() => {
+                triggerAutoDownload(file.url, file.fileName);
+              }, idx * 350);
+            });
+            if (voiceSettings.enableSoundCues) playSoundCue('success');
+          } else {
+            const zip = new JSZip();
+            for (const track of completedTracks) {
+              zip.file(track.trackName, track.blob);
+            }
+
+            const metadata = {
+              title: book.title,
+              author: book.author || 'Tác giả',
+              totalChapters: completedTracks.length,
+              totalBookChapters: book.chapters.length,
+              totalWords: book.wordCount,
+              audioFormat: fileExt.toUpperCase(),
+              voiceEngine: voiceSettings.engine,
+              voiceId: voiceSettings.voiceId,
+              voiceName: selectedVoiceName,
+              strictSingleVoice: true,
+              exportedAt: new Date().toISOString(),
+              chapters: completedTracks.map((t) => ({
+                track: t.actualIndex + 1,
+                fileName: t.trackName,
+                title: t.title,
+              })),
+            };
+            zip.file('thong_tin_audio.json', JSON.stringify(metadata, null, 2));
+
+            setProgress((prev) => ({
+              ...prev,
+              status: 'zipping',
+              message: `Đang nén ${completedTracks.length} file âm thanh thành tệp .ZIP...`,
+            }));
+
+            const zipBlob = await zip.generateAsync({ type: 'blob', compression: 'STORE' });
+            const url = URL.createObjectURL(zipBlob);
+            const fileName =
+              exportScope === 'zip_chapters'
+                ? `${safeTitle}_Audio_TronBo_${fileExt.toUpperCase()}.zip`
+                : `${safeTitle}_Audio_DaChon_${completedTracks.length}chuong_${fileExt.toUpperCase()}.zip`;
+
+            setProgress({
+              status: 'completed',
+              currentChapter: totalSegments,
+              totalChapters: totalSegments,
+              message: `Đã nén xong ${completedTracks.length} file âm thanh hoàn chỉnh! Đang tải về...`,
+              downloadUrl: url,
+              fileName,
+              separateFiles: [],
+            });
+
+            triggerAutoDownload(url, fileName);
+            if (voiceSettings.enableSoundCues) playSoundCue('success');
+          }
+        }
+
+        if (voiceSettings.enableSpokenGuide) {
+          speakAnnouncement('Đã xuất xong file âm thanh và bắt đầu tải về.', voiceSettings);
+        }
+        return;
+      }
+
+      // Incomplete (either Paused by user OR missingSegments > 0 after 3 repair rounds):
+      // Keep ALL completed segments in IndexedDB for instant Resume, and ONLY package 100%-complete chapters!
+      const wasPaused = cancelRequestedRef.current;
+      let cleanUrl = '';
+      let cleanFileName = '';
+      const cleanSeparateFiles: { fileName: string; url: string; title: string; isPartial?: boolean }[] = [];
+      let cleanChapterCount = 0;
+
+      if (isMultiScope) {
+        const fullyDoneChapters = chaptersPlan.filter((cp) =>
+          cp.segmentIndices.every((idx) => segmentMap.has(idx))
+        );
+
+        if (fullyDoneChapters.length > 0) {
+          const completedTracks: { actualIndex: number; title: string; trackName: string; blob: Blob }[] = [];
+          for (const chapPlan of fullyDoneChapters) {
+            const chunks = chapPlan.segmentIndices.map((idx) => segmentMap.get(idx)!);
+            const blob = await buildAudioBlobFromBase64Chunks(chunks, exportFormat);
+            completedTracks.push({
+              actualIndex: chapPlan.actualIndex,
+              title: chapPlan.title,
+              trackName: chapPlan.trackName,
+              blob,
+            });
+          }
+          cleanChapterCount = completedTracks.length;
+
+          if (activeDelivery === 'separate') {
+            for (const track of completedTracks) {
               cleanSeparateFiles.push({
                 fileName: track.trackName,
                 url: URL.createObjectURL(track.blob),
                 title: track.title,
               });
             }
-            partialNote = ` Đã bỏ qua file bị lỗi/dở dang và chỉ giữ lại ${completedZipTracks.length}/${expectedCount} file hoàn chỉnh (không lỗi) bên dưới để bạn tải về.`;
           } else {
             const cleanZip = new JSZip();
-            for (const track of completedZipTracks) {
+            for (const track of completedTracks) {
               cleanZip.file(track.trackName, track.blob);
             }
-
             const metadata = {
               title: book.title,
               author: book.author || 'Tác giả',
-              totalChapters: completedZipTracks.length,
+              totalChapters: completedTracks.length,
               totalBookChapters: book.chapters.length,
               totalWords: book.wordCount,
               audioFormat: fileExt.toUpperCase(),
@@ -710,34 +1008,53 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
               strictSingleVoice: true,
               partialSuccessOnlyCompletedFiles: true,
               exportedAt: new Date().toISOString(),
-              chapters: completedZipTracks.map((t) => ({
-                track: t.index + 1,
+              chapters: completedTracks.map((t) => ({
+                track: t.actualIndex + 1,
                 fileName: t.trackName,
                 title: t.title,
               })),
             };
             cleanZip.file('thong_tin_audio.json', JSON.stringify(metadata, null, 2));
-
             const cleanZipBlob = await cleanZip.generateAsync({ type: 'blob', compression: 'STORE' });
-            partialUrl = URL.createObjectURL(cleanZipBlob);
-            partialFileName = `${safeTitle}_Audio_${completedZipTracks.length}tren${expectedCount}_chuong_${fileExt.toUpperCase()}.zip`;
-            partialNote = ` Đã bỏ qua file bị lỗi/dở dang và chỉ giữ lại ${completedZipTracks.length}/${expectedCount} file hoàn chỉnh (không lỗi) trong gói .ZIP bên dưới để bạn tải về.`;
+            cleanUrl = URL.createObjectURL(cleanZipBlob);
+            cleanFileName = `${safeTitle}_Audio_${completedTracks.length}tren${chaptersPlan.length}_chuong_${fileExt.toUpperCase()}.zip`;
           }
-        } else {
-          partialNote = ' File bị lỗi/dở dang đã được loại bỏ hoàn toàn (không giữ lại bản thiếu câu).';
         }
-      } catch (partialErr) {
-        console.warn('Could not package clean completed files:', partialErr);
       }
 
+      const missingCount = missingSegments.length;
+      const statusReason = wasPaused
+        ? `Đã tạm dừng và lưu an toàn ${doneTotal}/${totalSegments} đoạn trong bộ nhớ tạm (còn thiếu ${missingCount} đoạn). Bấm "Tải bù ${missingCount} đoạn còn thiếu" để chạy tiếp không mất tiến trình.`
+        : `Đã lưu an toàn ${doneTotal}/${totalSegments} đoạn, hiện còn thiếu ${missingCount} đoạn sau 3 vòng tự tải bù (${lastErrorMessage || 'Máy chủ giọng đọc tạm nghẽn'}). Các file thiếu câu không được xuất ra — hãy bấm "Tải bù ${missingCount} đoạn còn thiếu" để tải nốt!`;
+
+      const extraCleanNote =
+        isMultiScope && cleanChapterCount > 0
+          ? ` Ngoài ra, đã tách sẵn ${cleanChapterCount}/${chaptersPlan.length} file chương hoàn chỉnh (không lỗi) bên dưới nếu bạn muốn tải ngay.`
+          : '';
+
+      setProgress({
+        status: wasPaused ? 'paused' : 'error',
+        currentChapter: doneTotal,
+        totalChapters: totalSegments,
+        message: statusReason + extraCleanNote,
+        downloadUrl: cleanUrl,
+        fileName: cleanFileName,
+        separateFiles: cleanSeparateFiles,
+      });
+
+      if (!wasPaused && voiceSettings.enableSoundCues) {
+        playSoundCue('error');
+      }
+    } catch (err: any) {
+      console.error('Export error:', err);
       setProgress({
         status: 'error',
         currentChapter: 0,
         totalChapters: 0,
-        message: (err?.message || 'Có lỗi xảy ra trong quá trình tạo file âm thanh.') + partialNote,
-        downloadUrl: partialUrl,
-        fileName: partialFileName,
-        separateFiles: cleanSeparateFiles,
+        message: err?.message || 'Có lỗi xảy ra trong quá trình tạo file âm thanh.',
+        downloadUrl: '',
+        fileName: '',
+        separateFiles: [],
       });
       if (voiceSettings.enableSoundCues) playSoundCue('error');
     } finally {
@@ -771,7 +1088,7 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
 
           <button
             type="button"
-            onClick={onClose}
+            onClick={handleCloseModal}
             className={`p-2 rounded-xl ${themeConfig.card} ${themeConfig.border} border ${themeConfig.textSecondary} hover:${themeConfig.textPrimary} transition-all`}
             aria-label="Đóng bảng xuất âm thanh"
           >
@@ -1116,17 +1433,42 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
             </div>
           </div>
 
+          {/* Saved Checkpoint Resume Banner */}
+          {!isExporting &&
+            savedCheckpointCount > 0 &&
+            savedCheckpointCount < exportPlan.segments.length && (
+              <div className="p-3.5 rounded-2xl border border-emerald-500/40 bg-emerald-500/10 text-emerald-200 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                <div className="space-y-0.5">
+                  <p className="font-bold text-emerald-300">
+                    Đã lưu tạm {savedCheckpointCount}/{exportPlan.segments.length} đoạn (chỉ còn thiếu{' '}
+                    {exportPlan.segments.length - savedCheckpointCount} đoạn)
+                  </p>
+                  <p className="opacity-90">
+                    Bấm nút tải bên dưới để chạy bù phần còn thiếu mà không phải tải lại từ đầu.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleClearCheckpoints}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-black/30 hover:bg-black/50 border border-emerald-400/30 text-emerald-200 font-bold text-[11px] flex-shrink-0 transition-all"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>Xóa bản tạm</span>
+                </button>
+              </div>
+            )}
+
           {/* Progress / Status Display */}
           {progress.status !== 'idle' && (
             <div className={`space-y-3 p-4 rounded-2xl ${themeConfig.cardInner} border ${themeConfig.border} animate-in fade-in`}>
               {progress.status !== 'error' && (
-                <div className="flex items-center justify-between text-xs font-bold">
+                <div className="flex items-center justify-between text-xs font-bold gap-2">
                   <span className="flex items-center gap-2" style={{ color: themeConfig.hex.accent }}>
-                    {isExporting && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                    {isExporting && <Loader2 className="w-3.5 h-3.5 animate-spin flex-shrink-0" />}
                     <span>{progress.message}</span>
                   </span>
                   {progress.totalChapters > 1 && (
-                    <span className={themeConfig.textPrimary}>
+                    <span className={`${themeConfig.textPrimary} flex-shrink-0`}>
                       {progress.currentChapter}/{progress.totalChapters}
                     </span>
                   )}
@@ -1141,7 +1483,7 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
                       backgroundColor: themeConfig.hex.accent,
                       width: `${
                         progress.totalChapters > 0
-                          ? Math.min(100, Math.max(15, (progress.currentChapter / progress.totalChapters) * 100))
+                          ? Math.min(100, Math.max(5, (progress.currentChapter / progress.totalChapters) * 100))
                           : 50
                       }%`,
                     }}
@@ -1166,6 +1508,34 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
               {/* Download Ready List (Separate Multiple Files) */}
               {progress.status === 'completed' && progress.separateFiles.length > 0 && (
                 <div className="pt-2 space-y-1.5 max-h-48 overflow-y-auto pr-1">
+                  {progress.separateFiles.map((file) => (
+                    <a
+                      key={file.fileName}
+                      href={file.url}
+                      download={file.fileName}
+                      className="w-full flex items-center justify-between gap-2 py-2.5 px-3.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-stone-950 font-black text-xs shadow active:scale-98 transition-all"
+                    >
+                      <span className="truncate">{file.fileName}</span>
+                      <Download className="w-4 h-4 flex-shrink-0 stroke-[2.5]" />
+                    </a>
+                  ))}
+                </div>
+              )}
+
+              {/* Clean completed tracks available when paused or partially errored */}
+              {progress.status === 'paused' && progress.downloadUrl && progress.fileName && (
+                <a
+                  href={progress.downloadUrl}
+                  download={progress.fileName}
+                  className="w-full flex items-center justify-center gap-2 py-3 px-4 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-stone-950 font-black text-xs sm:text-sm shadow-lg shadow-emerald-500/20 active:scale-95 transition-all"
+                >
+                  <Download className="w-4 h-4 stroke-[2.5]" />
+                  <span className="truncate">Tải các file đã xong hoàn chỉnh ({progress.fileName})</span>
+                </a>
+              )}
+
+              {progress.status === 'paused' && progress.separateFiles.length > 0 && (
+                <div className="space-y-1.5 max-h-44 overflow-y-auto pr-1">
                   {progress.separateFiles.map((file) => (
                     <a
                       key={file.fileName}
@@ -1205,9 +1575,7 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
                           key={file.fileName}
                           href={file.url}
                           download={file.fileName}
-                          className={`w-full flex items-center justify-between gap-2 py-2.5 px-3.5 rounded-xl ${
-                            file.isPartial ? 'bg-amber-500 hover:bg-amber-400' : 'bg-emerald-500 hover:bg-emerald-400'
-                          } text-stone-950 font-black text-xs shadow active:scale-98 transition-all`}
+                          className="w-full flex items-center justify-between gap-2 py-2.5 px-3.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-stone-950 font-black text-xs shadow active:scale-98 transition-all"
                         >
                           <span className="truncate">{file.fileName}</span>
                           <Download className="w-4 h-4 flex-shrink-0 stroke-[2.5]" />
@@ -1222,37 +1590,49 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
         </div>
 
         {/* Footer Actions */}
-        <div className={`flex items-center justify-end gap-3 p-4 border-t ${themeConfig.border} ${themeConfig.cardInner}`}>
+        <div className={`flex flex-wrap items-center justify-end gap-2.5 p-4 border-t ${themeConfig.border} ${themeConfig.cardInner}`}>
           <button
             type="button"
-            onClick={onClose}
+            onClick={handleCloseModal}
             className={`px-4 py-2.5 rounded-xl text-xs font-bold ${themeConfig.textSecondary} hover:${themeConfig.textPrimary}`}
           >
             Đóng
           </button>
 
-          <button
-            type="button"
-            onClick={handleStartExport}
-            disabled={
-              isExporting ||
-              isNativeVoiceSelected ||
-              (exportScope === 'selected_chapters' && selectedChapterIndices.length === 0)
-            }
-            className={`flex items-center gap-2 px-6 py-2.5 rounded-xl text-xs sm:text-sm font-black ${themeConfig.accent} ${themeConfig.accentHover} ${themeConfig.accentText} shadow-md transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed`}
-          >
-            {isExporting ? (
-              <>
-                <Loader2 className="w-4 h-4 animate-spin" />
-                <span>Đang xử lý âm thanh...</span>
-              </>
-            ) : (
-              <>
-                <Download className="w-4 h-4 stroke-[2.5]" />
-                <span>Tải file Audio ngay (.{exportFormat.toUpperCase()})</span>
-              </>
-            )}
-          </button>
+          {isExporting ? (
+            <button
+              type="button"
+              onClick={handlePauseExport}
+              className="flex items-center gap-2 px-5 py-2.5 rounded-xl text-xs sm:text-sm font-black bg-amber-500 hover:bg-amber-400 text-stone-950 shadow-md transition-all active:scale-95"
+            >
+              <Pause className="w-4 h-4 stroke-[2.5]" />
+              <span>Tạm dừng (Lưu tiến trình)</span>
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => handleStartExport(false)}
+              disabled={
+                isNativeVoiceSelected ||
+                (exportScope === 'selected_chapters' && selectedChapterIndices.length === 0)
+              }
+              className={`flex items-center gap-2 px-6 py-2.5 rounded-xl text-xs sm:text-sm font-black ${themeConfig.accent} ${themeConfig.accentHover} ${themeConfig.accentText} shadow-md transition-all active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed`}
+            >
+              {savedCheckpointCount > 0 && savedCheckpointCount < exportPlan.segments.length ? (
+                <>
+                  <RefreshCw className="w-4 h-4 stroke-[2.5]" />
+                  <span>
+                    Tải bù {exportPlan.segments.length - savedCheckpointCount} đoạn còn thiếu (.{exportFormat.toUpperCase()})
+                  </span>
+                </>
+              ) : (
+                <>
+                  <Download className="w-4 h-4 stroke-[2.5]" />
+                  <span>Tải file Audio ngay (.{exportFormat.toUpperCase()})</span>
+                </>
+              )}
+            </button>
+          )}
         </div>
       </div>
     </div>
