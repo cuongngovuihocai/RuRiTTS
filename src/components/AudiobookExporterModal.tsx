@@ -125,6 +125,22 @@ function splitTextForTtsExport(rawText: string, maxChars = 450): string[] {
   return filterSpeakable(chunks);
 }
 
+function unpackSegmentBase64List(raw: string): string[] {
+  if (!raw) return [];
+  const trimmed = raw.trim();
+  if (trimmed.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) {
+        return parsed.filter((x): x is string => typeof x === 'string' && x.length > 0);
+      }
+    } catch {
+      // Fallback to treating raw as a single base64 audio string
+    }
+  }
+  return [raw];
+}
+
 interface PlannedSegment {
   globalIndex: number;
   chapterIndex: number;
@@ -235,7 +251,7 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
   const exportPlan = useMemo<ExportPlan>(() => {
     const fileExt: 'mp3' | 'wav' = exportFormat === 'mp3' ? 'mp3' : 'wav';
     const safeTitle = sanitizeFileNameSafe(book.title || 'AudioBook');
-    const maxChunkLen = voiceSettings.engine === 'edge' ? 380 : 450;
+    const maxChunkLen = voiceSettings.engine === 'edge' ? 950 : 450;
     const isMultiScope = exportScope === 'zip_chapters' || exportScope === 'selected_chapters';
     const activeDelivery: 'zip' | 'separate' =
       exportScope === 'selected_chapters' ? selectedDeliveryMode : 'zip';
@@ -628,124 +644,62 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
 
       let lastErrorMessage = '';
 
-      // 2. Pass 1 — Download all pending segments without aborting the whole queue on single errors
+      // 2. Pass 1 — Fast parallel download (3 concurrent streams, large ~950-char chunks on Edge)
+      // Failed chunks are NOT stalled with long cooldowns here; they go straight to auto-repair with sub-splitting.
       const pass1Pending = segments.filter((s) => !segmentMap.has(s.globalIndex));
+      const CONCURRENCY = 3;
+      const pass1Attempts = voiceSettings.engine === 'edge' ? 1 : 2;
+      const pass1RetryDelay = 500;
 
-      if (voiceSettings.engine === 'google-translate') {
-        const CONCURRENCY = 3;
-        for (let i = 0; i < pass1Pending.length; i += CONCURRENCY) {
-          if (cancelRequestedRef.current) break;
-          const batch = pass1Pending.slice(i, i + CONCURRENCY);
-          await Promise.allSettled(
-            batch.map(async (seg) => {
-              try {
-                const b64 = await synthesizeSegmentStrict(
-                  seg.text,
-                  effectiveRate,
-                  effectivePitch,
-                  effectiveVolume,
-                  2,
-                  500
-                );
-                segmentMap.set(seg.globalIndex, b64);
-                await saveExportJobSegment(jobId, seg.globalIndex, b64);
-              } catch (err: any) {
-                if (err?.message !== 'EXPORT_PAUSED') {
-                  lastErrorMessage = err?.message || lastErrorMessage;
-                }
-              }
-            })
-          );
-
-          const doneNow = countCompleted();
-          setSavedCheckpointCount(doneNow);
-          setProgress({
-            status: 'generating',
-            currentChapter: doneNow,
-            totalChapters: totalSegments,
-            message: `Đang tải song song: đã xong ${doneNow}/${totalSegments} đoạn (${batch[0].chapterTitle})...`,
-            downloadUrl: '',
-            fileName: '',
-            separateFiles: [],
-          });
-
-          if (i + CONCURRENCY < pass1Pending.length && !cancelRequestedRef.current) {
-            await sleepInterruptible(40);
-          }
+      for (let i = 0; i < pass1Pending.length; i += CONCURRENCY) {
+        if (cancelRequestedRef.current) break;
+        if (typeof navigator !== 'undefined' && !navigator.onLine) {
+          lastErrorMessage = 'Thiết bị mất kết nối Internet.';
+          break;
         }
-      } else {
-        // Microsoft Edge: strictly sequential with gentle pacing + adaptive cooldown
-        let consecutiveErrors = 0;
-        for (let idx = 0; idx < pass1Pending.length; idx++) {
-          if (cancelRequestedRef.current) break;
-          const seg = pass1Pending[idx];
 
-          setProgress({
-            status: 'generating',
-            currentChapter: countCompleted(),
-            totalChapters: totalSegments,
-            message: `Đang tải đoạn ${seg.globalIndex + 1}/${totalSegments} (${seg.chapterTitle})...`,
-            downloadUrl: '',
-            fileName: '',
-            separateFiles: [],
-          });
-
-          try {
-            const b64 = await synthesizeSegmentStrict(
-              seg.text,
-              effectiveRate,
-              effectivePitch,
-              effectiveVolume,
-              2,
-              900
-            );
-            segmentMap.set(seg.globalIndex, b64);
-            await saveExportJobSegment(jobId, seg.globalIndex, b64);
-            consecutiveErrors = 0;
-
-            const doneNow = countCompleted();
-            setSavedCheckpointCount(doneNow);
-            setProgress({
-              status: 'generating',
-              currentChapter: doneNow,
-              totalChapters: totalSegments,
-              message: `Đã lưu an toàn ${doneNow}/${totalSegments} đoạn (${seg.chapterTitle})...`,
-              downloadUrl: '',
-              fileName: '',
-              separateFiles: [],
-            });
-
-            if (idx < pass1Pending.length - 1 && !cancelRequestedRef.current) {
-              await sleepInterruptible(320);
+        const batch = pass1Pending.slice(i, i + CONCURRENCY);
+        await Promise.allSettled(
+          batch.map(async (seg) => {
+            try {
+              const b64 = await synthesizeSegmentStrict(
+                seg.text,
+                effectiveRate,
+                effectivePitch,
+                effectiveVolume,
+                pass1Attempts,
+                pass1RetryDelay
+              );
+              segmentMap.set(seg.globalIndex, b64);
+              await saveExportJobSegment(jobId, seg.globalIndex, b64);
+            } catch (err: any) {
+              if (err?.message !== 'EXPORT_PAUSED') {
+                lastErrorMessage = err?.message || lastErrorMessage;
+              }
             }
-          } catch (err: any) {
-            if (err?.message === 'EXPORT_PAUSED' || cancelRequestedRef.current) break;
-            lastErrorMessage = err?.message || 'Lỗi kết nối Edge TTS';
-            consecutiveErrors++;
+          })
+        );
 
-            if (typeof navigator !== 'undefined' && !navigator.onLine) {
-              lastErrorMessage = 'Thiết bị mất kết nối Internet.';
-              break;
-            }
+        const doneNow = countCompleted();
+        setSavedCheckpointCount(doneNow);
+        setProgress({
+          status: 'generating',
+          currentChapter: doneNow,
+          totalChapters: totalSegments,
+          message: `Đang tải song song: đã xong ${doneNow}/${totalSegments} đoạn (${batch[0].chapterTitle})...`,
+          downloadUrl: '',
+          fileName: '',
+          separateFiles: [],
+        });
 
-            // Adaptive cooldown so Bing rate-limiting recovers, while moving on instead of losing progress
-            const cooldownMs = Math.min(10000, 2000 * consecutiveErrors);
-            setProgress({
-              status: 'generating',
-              currentChapter: countCompleted(),
-              totalChapters: totalSegments,
-              message: `Đoạn ${seg.globalIndex + 1} tạm nghẽn, chuyển qua tải bù sau (tạm nghỉ ${Math.round(cooldownMs / 1000)}s)...`,
-              downloadUrl: '',
-              fileName: '',
-              separateFiles: [],
-            });
-            await sleepInterruptible(cooldownMs);
-          }
+        if (i + CONCURRENCY < pass1Pending.length && !cancelRequestedRef.current) {
+          await sleepInterruptible(30);
         }
       }
 
-      // 3. Self-Healing Auto-Repair Rounds (IDM-style: retry ONLY missing segments!)
+      // 3. Self-Healing Auto-Repair Rounds (IDM-style: retry ONLY missing segments, auto-split failed ~950-char Edge segments into ~320-char sub-chunks!)
       const MAX_REPAIR_ROUNDS = 3;
+      const partialSubChunkMap = new Map<number, Map<number, string>>();
       let missingSegments = segments.filter((s) => !segmentMap.has(s.globalIndex));
 
       for (
@@ -755,13 +709,13 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
       ) {
         if (typeof navigator !== 'undefined' && !navigator.onLine) break;
 
-        const roundCooldownMs = voiceSettings.engine === 'edge' ? round * 4000 : round * 1500;
+        const roundCooldownMs = voiceSettings.engine === 'edge' ? round * 2500 : round * 1000;
         const cooldownSec = Math.round(roundCooldownMs / 1000);
         setProgress({
           status: 'generating',
           currentChapter: countCompleted(),
           totalChapters: totalSegments,
-          message: `Vòng tự tải bù ${round}/${MAX_REPAIR_ROUNDS}: tạm nghỉ ${cooldownSec}s cho máy chủ ổn định (còn ${missingSegments.length} đoạn)...`,
+          message: `Vòng tự tải bù ${round}/${MAX_REPAIR_ROUNDS}: tạm nghỉ ${cooldownSec}s trước khi tải bù ${missingSegments.length} đoạn còn thiếu...`,
           downloadUrl: '',
           fileName: '',
           separateFiles: [],
@@ -772,42 +726,81 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
         let consecutiveRepairErrors = 0;
         for (let m = 0; m < missingSegments.length; m++) {
           if (cancelRequestedRef.current) break;
-          if (typeof navigator !== 'undefined' && !navigator.onLine) break;
+          if (typeof navigator !== 'undefined' && !navigator.onLine) {
+            lastErrorMessage = 'Thiết bị mất kết nối Internet.';
+            break;
+          }
           const seg = missingSegments[m];
+          const rawSubTexts =
+            voiceSettings.engine === 'edge' && seg.text.length > 360
+              ? splitTextForTtsExport(seg.text, 320)
+              : [seg.text];
+          const subTexts = rawSubTexts.length > 0 ? rawSubTexts : [seg.text];
 
-          setProgress({
-            status: 'generating',
-            currentChapter: countCompleted(),
-            totalChapters: totalSegments,
-            message: `Tải bù vòng ${round}/${MAX_REPAIR_ROUNDS}: đoạn ${seg.globalIndex + 1}/${totalSegments} (${m + 1}/${missingSegments.length} đoạn thiếu)...`,
-            downloadUrl: '',
-            fileName: '',
-            separateFiles: [],
-          });
+          let subMap = partialSubChunkMap.get(seg.globalIndex);
+          if (!subMap) {
+            subMap = new Map<number, string>();
+            partialSubChunkMap.set(seg.globalIndex, subMap);
+          }
 
-          try {
-            const b64 = await synthesizeSegmentStrict(
-              seg.text,
-              effectiveRate,
-              effectivePitch,
-              effectiveVolume,
-              2,
-              1400
-            );
-            segmentMap.set(seg.globalIndex, b64);
-            await saveExportJobSegment(jobId, seg.globalIndex, b64);
-            consecutiveRepairErrors = 0;
-            setSavedCheckpointCount(countCompleted());
-
-            if (m < missingSegments.length - 1 && !cancelRequestedRef.current) {
-              await sleepInterruptible(voiceSettings.engine === 'edge' ? 450 : 120);
+          let segmentHadError = false;
+          for (let subIdx = 0; subIdx < subTexts.length; subIdx++) {
+            if (subMap.has(subIdx)) continue;
+            if (cancelRequestedRef.current) break;
+            if (typeof navigator !== 'undefined' && !navigator.onLine) {
+              lastErrorMessage = 'Thiết bị mất kết nối Internet.';
+              segmentHadError = true;
+              break;
             }
-          } catch (err: any) {
-            if (err?.message === 'EXPORT_PAUSED' || cancelRequestedRef.current) break;
-            lastErrorMessage = err?.message || lastErrorMessage;
-            consecutiveRepairErrors++;
-            const errWait = Math.min(12000, 3000 * consecutiveRepairErrors);
-            await sleepInterruptible(errWait);
+
+            setProgress({
+              status: 'generating',
+              currentChapter: countCompleted(),
+              totalChapters: totalSegments,
+              message:
+                subTexts.length > 1
+                  ? `Đang chẻ nhỏ tải bù vòng ${round}/${MAX_REPAIR_ROUNDS}: đoạn ${seg.globalIndex + 1}/${totalSegments} (mảnh ${subIdx + 1}/${subTexts.length})...`
+                  : `Tải bù vòng ${round}/${MAX_REPAIR_ROUNDS}: đoạn ${seg.globalIndex + 1}/${totalSegments} (${m + 1}/${missingSegments.length} đoạn thiếu)...`,
+              downloadUrl: '',
+              fileName: '',
+              separateFiles: [],
+            });
+
+            try {
+              const subB64 = await synthesizeSegmentStrict(
+                subTexts[subIdx],
+                effectiveRate,
+                effectivePitch,
+                effectiveVolume,
+                2,
+                800
+              );
+              subMap.set(subIdx, subB64);
+              consecutiveRepairErrors = 0;
+
+              if (subIdx < subTexts.length - 1 && !cancelRequestedRef.current) {
+                await sleepInterruptible(voiceSettings.engine === 'edge' ? 150 : 80);
+              }
+            } catch (err: any) {
+              if (err?.message === 'EXPORT_PAUSED' || cancelRequestedRef.current) {
+                segmentHadError = true;
+                break;
+              }
+              lastErrorMessage = err?.message || lastErrorMessage;
+              consecutiveRepairErrors++;
+              segmentHadError = true;
+              const errWait = Math.min(4000, 1200 * consecutiveRepairErrors);
+              await sleepInterruptible(errWait);
+            }
+          }
+
+          if (!segmentHadError && subMap.size === subTexts.length) {
+            const orderedSubs = subTexts.map((_, idx) => subMap!.get(idx)!);
+            const packedValue = orderedSubs.length === 1 ? orderedSubs[0] : JSON.stringify(orderedSubs);
+            segmentMap.set(seg.globalIndex, packedValue);
+            await saveExportJobSegment(jobId, seg.globalIndex, packedValue);
+            partialSubChunkMap.delete(seg.globalIndex);
+            setSavedCheckpointCount(countCompleted());
           }
         }
 
@@ -831,7 +824,9 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
 
         if (!isMultiScope) {
           const chapPlan = chaptersPlan[0];
-          const chunks = chapPlan.segmentIndices.map((idx) => segmentMap.get(idx)!);
+          const chunks = chapPlan.segmentIndices.flatMap((idx) =>
+            unpackSegmentBase64List(segmentMap.get(idx)!)
+          );
           const audioBlob = await buildAudioBlobFromBase64Chunks(chunks, exportFormat);
           const url = URL.createObjectURL(audioBlob);
 
@@ -859,7 +854,9 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
               status: 'zipping',
               message: `Đang ghép âm thanh chương ${cIdx + 1}/${chaptersPlan.length}: "${chapPlan.title}"...`,
             }));
-            const chunks = chapPlan.segmentIndices.map((idx) => segmentMap.get(idx)!);
+            const chunks = chapPlan.segmentIndices.flatMap((idx) =>
+              unpackSegmentBase64List(segmentMap.get(idx)!)
+            );
             const blob = await buildAudioBlobFromBase64Chunks(chunks, exportFormat);
             completedTracks.push({
               actualIndex: chapPlan.actualIndex,
@@ -971,7 +968,9 @@ export const AudiobookExporterModal: React.FC<AudiobookExporterModalProps> = ({
         if (fullyDoneChapters.length > 0) {
           const completedTracks: { actualIndex: number; title: string; trackName: string; blob: Blob }[] = [];
           for (const chapPlan of fullyDoneChapters) {
-            const chunks = chapPlan.segmentIndices.map((idx) => segmentMap.get(idx)!);
+            const chunks = chapPlan.segmentIndices.flatMap((idx) =>
+              unpackSegmentBase64List(segmentMap.get(idx)!)
+            );
             const blob = await buildAudioBlobFromBase64Chunks(chunks, exportFormat);
             completedTracks.push({
               actualIndex: chapPlan.actualIndex,

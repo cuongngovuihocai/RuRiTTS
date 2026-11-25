@@ -564,8 +564,23 @@ const EDGE_VOICE_PROFILES: Record<string, EdgeVoiceProfile> = {
   },
 };
 
-// Promise-chain mutex to serialize Edge TTS requests and prevent Bing rate-limiting/throttling
-let edgeTtsChain: Promise<any> = Promise.resolve();
+const MAX_CONCURRENT_EDGE_WS = 3;
+let activeEdgeWsCount = 0;
+const edgeWaitQueue: Array<() => void> = [];
+
+async function withEdgeConcurrencyLimit<T>(fn: () => Promise<T>): Promise<T> {
+  if (activeEdgeWsCount >= MAX_CONCURRENT_EDGE_WS) {
+    await new Promise<void>((resolve) => edgeWaitQueue.push(resolve));
+  }
+  activeEdgeWsCount++;
+  try {
+    return await fn();
+  } finally {
+    activeEdgeWsCount--;
+    const next = edgeWaitQueue.shift();
+    if (next) next();
+  }
+}
 
 // Direct, fast, non-blocking Edge TTS WebSocket synthesizer with v2 DRM authentication
 async function synthesizeEdgeDirectRaw(
@@ -574,7 +589,7 @@ async function synthesizeEdgeDirectRaw(
   userPitch: number = 1.0,
   userRate: number = 1.0,
   userVolume: number = 1.0,
-  timeoutMs: number = 12000
+  timeoutMs: number = 14000
 ): Promise<Buffer> {
   const profile = EDGE_VOICE_PROFILES[voice] || EDGE_VOICE_PROFILES['vi-VN-HoaiMyNeural'];
   const chosenBaseVoice = profile.baseVoice;
@@ -690,32 +705,27 @@ async function synthesizeEdgeDirectRaw(
   });
 }
 
-// Queued synthesizer with automatic retry and promise chain to prevent concurrent WebSocket connection throttling
+// Concurrent synthesizer (up to 3 simultaneous Edge WebSockets) with fast retry on early drop
 async function synthesizeEdgeDirect(
   chunkText: string,
   voice: string,
   userPitch: number = 1.0,
   userRate: number = 1.0,
   userVolume: number = 1.0,
-  timeoutMs: number = 12000
+  timeoutMs: number = 14000
 ): Promise<Buffer> {
-  const currentTask = edgeTtsChain.then(async () => {
+  return withEdgeConcurrencyLimit(async () => {
     const startedAt = Date.now();
     try {
       return await synthesizeEdgeDirectRaw(chunkText, voice, userPitch, userRate, userVolume, timeoutMs);
     } catch (firstErr) {
-      if (Date.now() - startedAt < 3000) {
-        await new Promise((r) => setTimeout(r, 250));
+      if (Date.now() - startedAt < 2500) {
+        await new Promise((r) => setTimeout(r, 200));
         return await synthesizeEdgeDirectRaw(chunkText, voice, userPitch, userRate, userVolume, timeoutMs);
       }
       throw firstErr;
     }
   });
-
-  // Ensure chain continues even if currentTask throws
-  edgeTtsChain = currentTask.catch(() => {});
-
-  return currentTask;
 }
 
 // 3. Microsoft Edge Neural Text-to-Speech (Hoài My, Nam Minh & Đầy đủ giọng Miền Nam, Miền Bắc, Miền Trung)
@@ -741,9 +751,9 @@ app.post('/api/tts/edge', async (req, res) => {
       return res.json(ttsAudioCache.get(cacheKey));
     }
 
-    const maxChunkChars = isStrict ? 420 : 1200;
-    const maxSentChars = isStrict ? 380 : 1000;
-    const maxWordChunkChars = isStrict ? 350 : 800;
+    const maxChunkChars = isStrict ? 1050 : 1200;
+    const maxSentChars = isStrict ? 1000 : 1000;
+    const maxWordChunkChars = isStrict ? 900 : 800;
 
     // Split into chunks at sentence punctuation for reliable Edge TTS streaming
     const chunks: string[] = [];
@@ -780,7 +790,7 @@ app.post('/api/tts/edge', async (req, res) => {
 
     const audioBuffers: Buffer[] = [];
     let usedGoogleFallback = false;
-    const edgeTimeoutMs = isStrict ? 12000 : 9000;
+    const edgeTimeoutMs = isStrict ? 14000 : 9000;
 
     for (const chunk of chunks) {
       const trimmedChunk = chunk.trim();

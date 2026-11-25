@@ -416,7 +416,23 @@ const EDGE_VOICE_PROFILES: Record<string, EdgeVoiceProfile> = {
   },
 };
 
-let edgeTtsChain: Promise<any> = Promise.resolve();
+const MAX_CONCURRENT_EDGE_WS = 3;
+let activeEdgeWsCount = 0;
+const edgeWaitQueue: Array<() => void> = [];
+
+async function withEdgeConcurrencyLimit<T>(fn: () => Promise<T>): Promise<T> {
+  if (activeEdgeWsCount >= MAX_CONCURRENT_EDGE_WS) {
+    await new Promise<void>((resolve) => edgeWaitQueue.push(resolve));
+  }
+  activeEdgeWsCount++;
+  try {
+    return await fn();
+  } finally {
+    activeEdgeWsCount--;
+    const next = edgeWaitQueue.shift();
+    if (next) next();
+  }
+}
 
 async function synthesizeEdgeDirectRaw(
   chunkText: string,
@@ -424,7 +440,7 @@ async function synthesizeEdgeDirectRaw(
   userPitch = 1.0,
   userRate = 1.0,
   userVolume = 1.0,
-  timeoutMs = 8500
+  timeoutMs = 8800
 ): Promise<Buffer> {
   const profile = EDGE_VOICE_PROFILES[voice] || EDGE_VOICE_PROFILES['vi-VN-HoaiMyNeural'];
   const chosenBaseVoice = profile.baseVoice;
@@ -546,24 +562,21 @@ export async function synthesizeEdgeDirect(
   userPitch = 1.0,
   userRate = 1.0,
   userVolume = 1.0,
-  timeoutMs = 8500
+  timeoutMs = 8800
 ): Promise<Buffer> {
-  const currentTask = edgeTtsChain.then(async () => {
+  return withEdgeConcurrencyLimit(async () => {
     const startedAt = Date.now();
     try {
       return await synthesizeEdgeDirectRaw(chunkText, voice, userPitch, userRate, userVolume, timeoutMs);
     } catch (firstErr) {
-      // Only do a fast inline retry if the first attempt failed quickly (< 2.2s)
-      if (Date.now() - startedAt < 2200) {
-        await new Promise((r) => setTimeout(r, 250));
+      // Only do a fast inline retry if the first attempt failed quickly (< 1.8s)
+      if (Date.now() - startedAt < 1800) {
+        await new Promise((r) => setTimeout(r, 200));
         return await synthesizeEdgeDirectRaw(chunkText, voice, userPitch, userRate, userVolume, timeoutMs);
       }
       throw firstErr;
     }
   });
-
-  edgeTtsChain = currentTask.catch(() => {});
-  return currentTask;
 }
 
 const ttsAudioCache = new Map<string, { audioBase64: string; mimeType: string; sampleRate: number; voice: string; isFallback?: boolean; fallbackVoiceName?: string; fallbackReason?: string; success: boolean }>();
@@ -591,9 +604,9 @@ export async function synthesizeEdgeSpeechPayload(params: {
     return ttsAudioCache.get(cacheKey)!;
   }
 
-  const maxChunkChars = strict ? 420 : 1000;
-  const maxSentChars = strict ? 380 : 900;
-  const maxWordChunkChars = strict ? 350 : 800;
+  const maxChunkChars = strict ? 1050 : 1000;
+  const maxSentChars = strict ? 1000 : 900;
+  const maxWordChunkChars = strict ? 900 : 800;
 
   const chunks: string[] = [];
   if (cleanText.length <= maxChunkChars) {
@@ -629,7 +642,7 @@ export async function synthesizeEdgeSpeechPayload(params: {
 
   const audioBuffers: Buffer[] = [];
   let usedGoogleFallback = false;
-  const edgeTimeoutMs = strict ? 8500 : 7500;
+  const edgeTimeoutMs = strict ? 8800 : 7500;
 
   for (const chunk of chunks) {
     const trimmedChunk = chunk.trim();
